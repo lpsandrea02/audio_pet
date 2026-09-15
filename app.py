@@ -31,7 +31,6 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
                       sample_rate=44100,
                       character=character) 
     
-
     #output_audio_filename="cute_bubbly_happy.wav"
 
     return {
@@ -49,6 +48,7 @@ def index():
     return render_template("index.html")
 
 @app.route("/api/process-audio", methods=["POST"])
+@app.route("/api/process-audio", methods=["POST"])
 def process_audio():
     """
     Unified route handling data uploads. 
@@ -58,20 +58,24 @@ def process_audio():
         return jsonify({"error": "No file payload detected"}), 400
         
     audio_file = request.files["file"]
-    current_skin = request.form.get("current_skin", "default_cat")
+    
+    # Extract the active character selection sent from the frontend screen
+    # Defaults to 'default_cat' if the data field happens to be blank
+    character_name = request.form.get("current_skin", "default_cat")
     current_emotion = request.form.get("current_emotion", "happy")
 
     if audio_file.filename == "":
         return jsonify({"error": "Empty filename property"}), 400
 
-    # 1. Save incoming audio binary file to disk
+    # 1. Save incoming audio binary file to disk securely
     saved_input_path = os.path.join(UPLOAD_FOLDER, "incoming_recording.wav")
     audio_file.save(saved_input_path)
 
-    # 2. Fire the custom decision tree analytics
-    decision_payload = analyze_and_generate_reply(saved_input_path, character="radio_robot")
+    # 2. Fire the custom decision tree analytics, passing the chosen character name
+    decision_payload = analyze_and_generate_reply(saved_input_path, character=character_name)
     
     return jsonify(decision_payload)
+
 
 
 @app.route("/stream-audio/<filename>")

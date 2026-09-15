@@ -3,6 +3,27 @@ import numpy as np
 import scipy.io.wavfile as wavfile
 import librosa
 
+VOICE_PROFILES = {
+    'default_cat':       {'wave_type': 'triangle', 'pitch_scale': 1.0, 'sub_octave': 0.0, 'jitter': 0.001, 'ring_mod_freq': 0,  'animal_mod': 'cat',  'gain': 0.7},
+    'radio_robot':     {'wave_type': 'square',   'pitch_scale': 1.0, 'sub_octave': 0.2, 'jitter': 0.0,   'ring_mod_freq': 40, 'animal_mod': None,  'gain': 0.4},
+    'tiny_dog':      {'wave_type': 'pulse',    'pitch_scale': 1.0, 'sub_octave': 0.0, 'jitter': 0.003, 'ring_mod_freq': 0,  'animal_mod': 'dog',  'gain': 0.5},
+    'chubby_hamster':    {'wave_type': 'triangle', 'pitch_scale': 0.5, 'sub_octave': 0.3, 'jitter': 0.005, 'ring_mod_freq': 0,  'animal_mod': None,  'gain': 0.7},
+    'evil_villain': {'wave_type': 'pulse',    'pitch_scale': 2.0, 'sub_octave': 0.0, 'jitter': 0.008, 'ring_mod_freq': 12, 'animal_mod': None,  'gain': 0.4},
+    'chirp_bird':        {'wave_type': 'sine',     'pitch_scale': 2.8, 'sub_octave': 0.0, 'jitter': 0.0,   'ring_mod_freq': 0,  'animal_mod': 'bird', 'gain': 0.5}
+}
+
+EMOTION_PROFILES = {
+    'none':      {'vib_speed': 0,   'vib_depth': 0.0,   'pitch_envelope': None},
+    'happy':     {'vib_speed': 11,  'vib_depth': 0.012, 'pitch_envelope': 'chirp'},
+    'sad':       {'vib_speed': 4.5, 'vib_depth': 0.020, 'pitch_envelope': 'whine'},
+    'confused':  {'vib_speed': 7,   'vib_depth': 0.008, 'pitch_envelope': 'question'},
+    'angry':     {'vib_speed': 0,   'vib_depth': 0.0,   'pitch_envelope': 'bark'}
+}
+
+# =====================================================================
+# 1. INPUT MELODY DETECTION 
+# =====================================================================
+
 def normalize_audio(input_wav, output_wav):
     """Boosts the audio file volume to its mathematical maximum limit."""
     data, sr = librosa.load(input_wav, sr=None)
@@ -70,7 +91,7 @@ def detect_melody(filename):
             if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
                 duration_secs = note_frame_count * FRAME_DURATION
                 melody_data.append({
-                    "pitch": current_note,
+                    "pitch": midi_to_note_name(current_note),
                     "duration": round(duration_secs, 2)
                 })
                 
@@ -83,13 +104,13 @@ def detect_melody(filename):
             if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
                 duration_secs = note_frame_count * FRAME_DURATION
                 melody_data.append({
-                    "pitch": current_note,
+                    "pitch": midi_to_note_name(current_note),
                     "duration": round(duration_secs, 2)
                 })
             break
 
     for item in melody_data:
-        print(f"🎵 Note: {midi_to_note_name(item['pitch']):<5} | ⏱️ Duration: {item['duration']} seconds")
+        print(f"🎵 Note: {item['pitch']:<5} | ⏱️ Duration: {item['duration']} seconds")
 
     return melody_data
 
@@ -97,38 +118,136 @@ def midi_to_freq(midi_num):
     """Converts a MIDI note number to its frequency in Hertz."""
     return 440.0 * (2.0 ** ((midi_num - 69) / 12.0))
 
+
+# =====================================================================
+# 2. RESPONSE SYNTHESIS
+# =====================================================================
+
+def _get_frequency(note_str):
+    """Calculates exact frequency for standard notation strings like 'C5' or 'F#4'."""
+    if isinstance(note_str, (int, float)):
+        return float(note_str)
+    note_str = str(note_str).strip()
+    if note_str in ['rest', '', '0']:
+        return 0.0
+    chromatic_scale = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    try:
+        note_name = note_str[:-1]
+        octave = int(note_str[-1])
+        semitones_from_c4 = chromatic_scale.index(note_name) + (octave - 4) * 12
+        c4_freq = 440 * (2 ** (-9 / 12)) 
+        return c4_freq * (2 ** (semitones_from_c4 / 12))
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _generate_tone_with_emotion(base_freq, duration, voice_cfg, emotion_cfg, is_last_note, sample_rate):
+    """Synthesizes a voice wave block that matches the exact original duration."""
+    if base_freq == 0:
+        return np.zeros(int(sample_rate * duration))
+        
+    freq = base_freq * voice_cfg['pitch_scale']
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    
+    # 1. Base Vibrato (from Emotion Profile)
+    inst_freq = np.ones_like(t) * freq
+    if emotion_cfg['vib_depth'] > 0:
+        vibrato = 1.0 + emotion_cfg['vib_depth'] * np.sin(2 * np.pi * emotion_cfg['vib_speed'] * t)
+        inst_freq *= vibrato
+        
+    # 2. Emotional Pitch Curves
+    env_type = emotion_cfg['pitch_envelope']
+    if env_type == 'chirp':
+        inst_freq *= (1.0 + 0.05 * np.exp(-t * 40))
+    elif env_type == 'whine':
+        inst_freq *= (1.0 - 0.06 * (t / duration))
+    elif env_type == 'question' and is_last_note:
+        inst_freq *= (1.0 + 0.30 * (t / duration)**3)
+    elif env_type == 'bark':
+        inst_freq *= (1.0 + 0.10 * np.exp(-t * 60))
+        
+    # 3. Native Animal Character Overrides
+    if voice_cfg['animal_mod'] == 'cat':
+        inst_freq *= (1.0 + 0.08 * np.sin(np.pi * (t / duration)) - 0.04 * (t / duration))
+    elif voice_cfg['animal_mod'] == 'dog':
+        inst_freq *= (1.0 + 0.15 * np.exp(-t * 40))
+    elif voice_cfg['animal_mod'] == 'bird':
+        inst_freq *= (0.98 + 0.08 * (t / duration)**2)
+        
+    # 4. Organic Voice Micro-Tremor
+    if voice_cfg['jitter'] > 0:
+        inst_freq *= (1.0 + np.random.uniform(-voice_cfg['jitter'], voice_cfg['jitter'], len(t)))
+        
+    phase = 2 * np.pi * np.cumsum(inst_freq) / sample_rate
+    
+    # 5. Timbre Synthesis
+    if voice_cfg['wave_type'] == 'sine':
+        wave = np.sin(phase)
+    elif voice_cfg['wave_type'] == 'triangle':
+        wave = 2 * np.abs(2 * (phase / (2 * np.pi) - np.floor(phase / (2 * np.pi) + 0.5))) - 1
+    elif voice_cfg['wave_type'] == 'square':
+        wave = np.sign(np.sin(phase))
+    elif voice_cfg['wave_type'] == 'pulse':
+        wave = np.where((phase % (2 * np.pi)) < (2 * np.pi * 0.25), 1.0, -1.0)
+        
+    # Sub-octaves
+    if voice_cfg['sub_octave'] > 0:
+        sub_phase = phase / 2.0
+        sub_wave = np.sign(np.sin(sub_phase)) if voice_cfg['wave_type'] == 'square' else np.sin(sub_phase)
+        wave = (wave * (1.0 - voice_cfg['sub_octave'])) + (sub_wave * voice_cfg['sub_octave'])
+        
+    # Ring mod
+    if voice_cfg['ring_mod_freq'] > 0:
+        wave *= np.sin(2 * np.pi * voice_cfg['ring_mod_freq'] * t)
+        
+    # 6. Envelope (Legato Style window to respect absolute timing)
+    env = np.ones_like(t)
+    attack_samples = int(0.015 * sample_rate)
+    release_samples = int(0.015 * sample_rate)
+    
+    if len(t) > (attack_samples + release_samples):
+        env[:attack_samples] = np.linspace(0, 1, attack_samples)
+        env[-release_samples:] = np.linspace(1, 0, release_samples)
+        
+    return wave * env * voice_cfg['gain']
+
+
 def synthesise_output(melody_log, 
                       output_filename="synthesized_melody.wav", 
-                      sample_rate=44100,
-                      character="default_cat"):
-    if not melody_log:
-        print("\nNo stable notes found to synthesize.")
-        return
-        
-    total_audio = []
+                      sample_rate=44100, 
+                      character="default_cat",
+                      emotion="none"):
+    """
+    Synthesizes structural .wav sequences from logs incorporating separate character and emotional modifiers.
     
-    for item in melody_log:
-        midi_num = item["pitch"]
-        note_duration = item["duration"]
-        
-        freq = 440.0 * (2.0 ** ((midi_num - 69) / 12.0))
-        num_samples = int(sample_rate * note_duration)
-        
-        t = np.linspace(0, note_duration, num_samples, endpoint=False)
-        sine_wave = np.sin(2 * np.pi * freq * t)
-        
-        # Audio envelope to smooth out cuts and clicks
-        fade_len = min(int(num_samples * 0.08), 1000)
-        envelope = np.ones(num_samples)
-        envelope[:fade_len] = np.linspace(0, 1, fade_len)
-        envelope[-fade_len:] = np.linspace(1, 0, fade_len)
-        
-        total_audio.append(sine_wave * envelope)
-        
-    full_audio = np.concatenate(total_audio)
-    full_audio = (full_audio / np.max(np.abs(full_audio)) * 32767).astype(np.int16)
+    Parameters:
+    - melody_log: List of {"pitch": str/int, "duration": float} dicts.
+    - emotion: 'none', 'happy', 'sad', 'confused', or 'angry'.
+    """
+    voice_cfg = VOICE_PROFILES.get(character, VOICE_PROFILES['default_cat'])
+    emotion_cfg = EMOTION_PROFILES.get(emotion, EMOTION_PROFILES['none'])
     
-    wavfile.write(output_filename, sample_rate, full_audio)
-    print(f"\n🎉 Successfully saved rhythm-accurate track to: {output_filename}")
-
-
+    audio_buffer = []
+    total_notes = len(melody_log)
+    
+    for idx, step in enumerate(melody_log):
+        note_str = step.get("pitch", "rest")
+        duration = step.get("duration", 0.2)
+        
+        base_freq = _get_frequency(note_str)
+        is_last_note = (idx == total_notes - 1)
+        
+        # Pass both matrices down the pipe seamlessly
+        tone = _generate_tone_with_emotion(
+            base_freq, duration, voice_cfg, emotion_cfg, is_last_note, sample_rate
+        )
+        audio_buffer.append(tone)
+        
+    audio_signal = np.concatenate(audio_buffer)
+    
+    if np.max(np.abs(audio_signal)) > 1.0:
+        audio_signal = audio_signal / np.max(np.abs(audio_signal))
+        
+    audio_int16 = np.int16(audio_signal * 32767)
+    wavfile.write(output_filename, sample_rate, audio_int16)
+    print(f"💾 Rendered -> {output_filename} ({character} + {emotion})")    
