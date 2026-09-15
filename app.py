@@ -1,4 +1,4 @@
-import os
+import os, shutil
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from audio_tools import normalize_audio, detect_melody, synthesise_output, determine_emotion
 
@@ -28,14 +28,25 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
 
     emotion = determine_emotion(note_sequence, input_wav_path)
 
-    synthesise_output(note_sequence, 
-                      output_filename=output_audio_path, 
-                      sample_rate=44100,
-                      character=character,
-                      emotion=emotion) 
-    
-    #output_audio_filename="cute_bubbly_happy.wav"
+    try:
+        synthesise_output(note_sequence, 
+                        output_filename=output_audio_path, 
+                        sample_rate=44100,
+                        character=character,
+                        emotion=emotion) 
+    except ValueError: # When audio is too short for melody log 
+        # Note sequence: 'D5', 'E5', 'F#5', 'G#5'. 
+        # Directly copy preexisting confused music files for convenience, but can replace this with synthesising the melody sequence instead
+        fallback_source = f"data/responses/{character}_confused.wav"
+        print(f"Warning: melody_log is empty! Attempting to copy preset fallback file: '{fallback_source}'")
+        try:
+            shutil.copy(fallback_source, output_audio_path)
+            print(f"Dynamic fallback copied successfully -> '{output_audio_path}'")
+            emotion = "confused"
+        except Exception as e:
+            print(f"Error copying fallback file: {e}")
 
+    
     return {
         "audio_url": f"/stream-audio/{output_audio_filename}", 
         "skin": character,

@@ -226,6 +226,7 @@ def synthesise_output(melody_log,
     - melody_log: List of {"pitch": str/int, "duration": float} dicts.
     - emotion: 'none', 'happy', 'sad', 'confused', or 'angry'.
     """
+        
     voice_cfg = VOICE_PROFILES.get(character, VOICE_PROFILES['default_cat'])
     emotion_cfg = EMOTION_PROFILES.get(emotion, EMOTION_PROFILES['none'])
     

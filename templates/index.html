@@ -131,39 +131,51 @@
 const CHARACTER_REGISTRY = {
     "default_cat": {
         "name": "Cat",
-        "happy":  { closed: "/\\_/\\\n(⌯ˆᵕˆ⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n(⌯ˆoˆ⌯)\n (ᐢ   ᐢ)꠹" },
+        "none":  { closed: "/\\_/\\\n(⌯ˆᵕˆ⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n(⌯ˆoˆ⌯)\n (ᐢ   ᐢ)꠹" },
+        "happy":  { closed: "/\\_/\\\n(⌯ˆᵕˆ⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n♡(⌯ˆoˆ⌯)♡\n (ᐢ   ᐢ)꠹" },
         "sad":    { closed: "/\\_/\\\n(⌯˃ᴖ˂⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n(⌯˃̣̣̥૦˂̣̣̥⌯)\n (ა   ૮)꠹" },
-        "angry":  { closed: "/\\_/\\\n(⌯˃ᴖ˂⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n(⌯˃o˂⌯)\n (ა   ૮)꠹" }
+        "angry":  { closed: "/\\_/\\\n(⌯˃ᴖ˂⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n(⌯˃o˂⌯)\n (ა   ૮)꠹" },
+        "confused":  { closed: "/\\_/\\\n(⌯ˆ-ˆ⌯)\n (ა   ૮)꠹", open: "/\\_/\\\n?(⌯ˆoˆ⌯)?\n (ა   ૮)꠹" }
     },
     "evil_villain": {
         "name": "Monster",
-        "happy":  { closed: "A__A\n(o̴̶̷̤`wˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n(o̴̶̷̤`⩌ˊo̴̶̷̤)\n  (ა    ૮)୭" },
+        "none":  { closed: "A__A\n(o̴̶̷̤`wˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n(o̴̶̷̤`⩌ˊo̴̶̷̤)\n  (ა    ૮)୭" },
+        "happy":  { closed: "A__A\n(o̴̶̷̤`wˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n꩜(o̴̶̷̤`⩌ˊo̴̶̷̤)꩜\n  (ა    ૮)୭" },
         "sad":    { closed: "A__A\n(o̴̶̷̤`⩌ˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n(o̴̶̷̤`ᗣˊo̴̶̷̤)\n  (ა    ૮)୭" },
-        "angry":  { closed: "A__A\n(o̴̶̷̤`mˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n(o̴̶̷̤`ᗣˊo̴̶̷̤)\n  (ა    ૮)୭" }
+        "angry":  { closed: "A__A\n(o̴̶̷̤`mˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n(o̴̶̷̤`ᗣˊo̴̶̷̤)\n  (ა    ૮)୭" },
+        "confused":  { closed: "A__A\n(o̴̶̷̤`mˊo̴̶̷̤)\n  (ა    ૮)୭", open: "A__A\n?(o̴̶̷̤`ᗣˊo̴̶̷̤)?\n  (ა    ૮)୭" },
     },
     "tiny_dog": {
         "name": "Dog",
-        "happy":  { closed: "(\\__/)\n(˵•̀⩊•́˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•̀∇•́˶)\n  (ა    ૮)੭" },
-        "sad":    { closed: "(\\__/)\n(˵•̀ᴖ•́˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•̀ᗝ•́˶)\n  (ა    ૮)੭" },
-        "angry":  { closed: "(\\__/)\n(˵•́ᴖ•̀˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•́ᗝ•̀˶)\n  (ა    ૮)੭" }
+        "none":  { closed: "(\\__/)\n(˵•̀⩊•́˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•̀∇•́˶)\n  (ა    ૮)੭" },
+        "happy":  { closed: "(\\__/)\n(˵•̀⩊•́˶)\n  (ა    ૮)੭", open: "(\\__/)\n⟡(˵•̀∇•́˶)⟡\n    (ა    ૮)੭⁾⁾" },
+        "angry":    { closed: "(\\__/)\n(˵•̀ᴖ•́˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•̀ᗝ•́˶)\n  (ა    ૮)੭" },
+        "sad":  { closed: "(\\__/)\n(˵•́ᴖ•̀˶)\n  (ა    ૮)੭", open: "(\\__/)\n(˵•́ᗝ•̀˶)\n  (ა    ૮)੭" },
+        "confused":  { closed: "(\\__/)\n(˵•́ᴖ•̀˶)\n  (ა    ૮)੭", open: "(\\__/)\n?(˵•́ᗝ•̀˶)?\n  (ა    ૮)੭" }
     },
     "radio_robot": {
         "name": "Robot",
-        "happy":  { closed: "|__/\n[◍°-°◍]\n│[▷]│", open: "|__/\n[◍°ㅁ°◍]\n│[⏸]│" },
+        "none":  { closed: "|__/\n[◍°-°◍]\n│[▷]│", open: "|__/\n[◍°ㅁ°◍]\n│[⏸]│" },
+        "happy":  { closed: "|__/\n[◍°-°◍]\n│[▷]│", open: "|__/\n♫[◍°ㅁ°◍]♫\n│[⏸]│" },
         "sad":    { closed: "|__/\n[◍°-°◍]\n│[▷]│", open: "|__/\n[◍°⌓°◍]\n│[⏸]│" },
-        "angry":  { closed: "|__/\n[◍#-#◍]\n│[!!]│", open: "\\__/\n[◍#0#◍]\n│[↺]│" }
+        "angry":  { closed: "|__/\n[◍#-#◍]\n│[!!]│", open: "\\__/\n[◍#0#◍]\n│[↺]│" },
+        "confused":    { closed: "|__/\n[◍°-°◍]\n│[?]│", open: "|__/\n?[◍°⌓°◍]?\n│[↺]│" }
     },    
     "chubby_hamster": {
         "name": "Hamster",
-        "happy":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n(♡´𓋰`♡)\n(ა       ૮)" },
+        "none":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n(♡´𓋰`♡)\n(ა       ૮)" },
+        "happy":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n❀(♡´𓋰`♡)❀\n(ა       ૮)" },
         "sad":    { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n     (♡´ᯅ`ς)՞°·.\n(っ       )" },
-        "angry":  { closed: "⑅ᐢ---ᐢ \n( ´︿` )\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n( ´𓋰`ꐦ)\n(ა       ૮)" }
+        "angry":  { closed: "⑅ᐢ---ᐢ \n( ´︿` )\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n( ´𓋰`ꐦ)\n(ა       ૮)" },
+        "confused":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n?(♡´𓋰`♡)?\n(ა       ૮)" }
     },
     "chirp_bird": {
         "name": "Bird",
-        "happy":  { closed: "𑣲\n(·ө·)\nଘ(⋋⋌)ଓ", open: "𑣲\n(·◇·)\n꒰ঌ(⋋⋌)໒꒱" },
+        "none":  { closed: "𑣲\n(·ө·)\nଘ(⋋⋌)ଓ", open: "𑣲\n(·◇·)\n꒰ঌ(⋋⋌)໒꒱" },
+        "happy":  { closed: "𑣲\n(·ө·)\nଘ(⋋⋌)ଓ", open: "𑣲\n♪(·◇·)♪\n꒰ঌ(⋋⋌)໒꒱" },
         "sad":    { closed: "𑣲\n(߹ө߹)\nଘ(⋋⋌)ଓ", open: "𑣲\n(߹◇߹)\nଘ(⋋⋌)ଓ" },
-        "angry":  { closed: "𑣲\n(°ө°)\nଘ(⋋⋌)ଓ", open: "𑣲\n(>◇<)\n₍₍⚞(⋋⋌)⚟⁾⁾" }
+        "angry":  { closed: "𑣲\n(°ө°)\nଘ(⋋⋌)ଓ", open: "𑣲\n(>◇<)\n₍₍⚞(⋋⋌)⚟⁾⁾" },
+        "confused":  { closed: "𑣲\n(·ө·)\nଘ(⋋⋌)ଓ", open: "𑣲\n?(·◇·)?\n꒰ঌ(⋋⋌)໒꒱" }
     }
 };
 
@@ -274,31 +286,43 @@ async function sendToFlaskBackend(blob) {
     const formData = new FormData();
     formData.append("file", blob, "user_mic_input.wav");
     formData.append("current_skin", currentSkin);
-    formData.append("current_emotion", currentEmotion);
+
+    // 1. SET STATUS IMMEDIATELY TO "Thinking..." DURING DYNAMIC GENERATION
+    statusText.textContent = "Status: Thinking...";
+    playBtn.disabled = true; // Clear the play button while thinking
 
     try {
         const response = await fetch("/api/process-audio", {
             method: "POST",
             body: formData
         });
+        
+        if (!response.ok) throw new Error("Server communication glitch");
+        
         const data = await response.json();
         
-        lastResponseAudioUrl = data.audio_url;
+        // Cache bust the audio stream with a timestamp
+        lastResponseAudioUrl = data.audio_url + "?t=" + new Date().getTime();
         currentSkin = data.skin || currentSkin; 
         currentEmotion = data.emotion || currentEmotion;
         
-        playBtn.disabled = false;
-        statusText.textContent = "Status: Processing complete. Autoplaying response...";
+        // 2. CHANGE STATUS TO INDICATE THE BUFFER PERIOD
+        statusText.textContent = "Status: Loading audio tracks...";
         renderFrame();
 
-        // --- NEW LINE: Trigger immediate playback automatically ---
-        triggerAudioPlayback();
+        // 3. THE FIXED BUFFERED DELAY (350ms to clear the OS file lock safely)
+        setTimeout(() => {
+            playBtn.disabled = false;
+            triggerAudioPlayback();
+        }, 350); 
 
     } catch (err) {
-        console.error(err);
+        console.error("Transmission breakdown details:", err);
         statusText.textContent = "Status: Endpoint error.";
+        playBtn.disabled = true;
     }
 }
+
 
 playBtn.addEventListener("click", () => {
     if (!lastResponseAudioUrl) return;
@@ -334,10 +358,11 @@ function triggerAudioPlayback() {
     });
 }
 
-// Keep standard click event listener targeting the shared engine
+// Keep your standard click event listener targeting the shared engine
 playBtn.addEventListener("click", () => {
     triggerAudioPlayback();
 });
+
 
 </script>
 </body>
