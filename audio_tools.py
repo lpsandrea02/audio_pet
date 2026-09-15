@@ -2,6 +2,8 @@ import aubio
 import numpy as np
 import scipy.io.wavfile as wavfile
 import librosa
+import io
+import wave
 
 VOICE_PROFILES = {
     'default_cat':       {'wave_type': 'triangle', 'pitch_scale': 1.0, 'sub_octave': 0.0, 'jitter': 0.001, 'ring_mod_freq': 0,  'animal_mod': 'cat',  'gain': 0.7},
@@ -89,7 +91,7 @@ def detect_melody(filename):
             # The note changed or silence occurred. 
             # Save the previous note if it lasted long enough to be real.
             if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
-                duration_secs = note_frame_count * FRAME_DURATION
+                duration_secs = note_frame_count * FRAME_DURATION + 0.1
                 melody_data.append({
                     "pitch": midi_to_note_name(current_note),
                     "duration": round(duration_secs, 2)
@@ -102,7 +104,7 @@ def detect_melody(filename):
         if read < hop_size:
             # Catch the very last trailing note of the audio file before ending
             if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
-                duration_secs = note_frame_count * FRAME_DURATION
+                duration_secs = note_frame_count * FRAME_DURATION + 0.1
                 melody_data.append({
                     "pitch": midi_to_note_name(current_note),
                     "duration": round(duration_secs, 2)
@@ -251,3 +253,52 @@ def synthesise_output(melody_log,
     audio_int16 = np.int16(audio_signal * 32767)
     wavfile.write(output_filename, sample_rate, audio_int16)
     print(f"💾 Rendered -> {output_filename} ({character} + {emotion})")    
+
+def _get_raw_audio_duration(input_path):
+    """
+    Extracts the duration (in seconds) from a raw audio input.
+    Accepts either a string file path or a bytes/file-like object.
+    """
+    try:
+        # If it's a file path string
+        if isinstance(input_path, str):
+            with wave.open(input_path, 'rb') as wav_file:
+                return wav_file.getnframes() / float(wav_file.getframerate())
+        # If it's a bytes object or an in-memory BytesIO stream
+        else:
+            file_stream = io.BytesIO(input_path) if isinstance(input_path, bytes) else input_path
+            with wave.open(file_stream, 'rb') as wav_file:
+                return wav_file.getnframes() / float(wav_file.getframerate())
+    except Exception as e:
+        print(f"Error reading raw audio properties: {e}. Defaulting duration comparison to 0.")
+        return 0.0
+
+def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
+    """
+    Determines the character's emotion string by analyzing the melody log structure 
+    and the real timeline of the raw input audio.
+    
+    Parameters:
+    - melody_log: List of dicts, e.g., [{"pitch": "C5", "duration": 0.25}, ...]
+    - input_path: A file path string (e.g., "recording.wav") OR raw wav bytes.
+    - choices: List of available emotion strings.
+    - probabilities: List of float weights matching the choices.
+    """
+    # Predict melody duration by summing up note lengths inside the log
+    predicted_duration = sum(step.get("duration", 0.0) for step in melody_log)
+    
+    # Extract actual time from the raw audio input
+    actual_duration = _get_raw_audio_duration(input_path)
+    
+    # CRITERION 1: If the response is significantly shorter than the input clip, default to confused
+    if predicted_duration < (actual_duration * 0.75):
+        print(f"🧐 Timeline mismatch! (Melody: {predicted_duration:.2f}s vs Raw: {actual_duration:.2f}s) -> Overriding to Confused.")
+        return "confused"
+    
+    # Default probability distribution 
+    if choices is None or probabilities is None:
+        choices =       ["none", "happy", "sad", "angry"]
+        probabilities = [0.70,   0.30,    0.00,  0.00] 
+        
+    # CRITERION 2: Manually adjustable random probability assignment
+    return np.random.choice(choices, p=probabilities)

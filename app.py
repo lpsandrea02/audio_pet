@@ -1,6 +1,6 @@
 import os
 from flask import Flask, jsonify, render_template, request, send_from_directory
-from audio_tools import normalize_audio, detect_melody, synthesise_output
+from audio_tools import normalize_audio, detect_melody, synthesise_output, determine_emotion
 
 app = Flask(__name__)
 
@@ -26,17 +26,20 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
     output_audio_filename = "system_reply.wav"
     output_audio_path = os.path.join(RESPONSE_FOLDER, output_audio_filename)
 
+    emotion = determine_emotion(note_sequence, input_wav_path)
+
     synthesise_output(note_sequence, 
                       output_filename=output_audio_path, 
                       sample_rate=44100,
-                      character=character) 
+                      character=character,
+                      emotion=emotion) 
     
     #output_audio_filename="cute_bubbly_happy.wav"
 
     return {
         "audio_url": f"/stream-audio/{output_audio_filename}", 
         "skin": character,
-        "emotion": "happy"
+        "emotion": emotion
     }
 
 # =====================================================================
@@ -75,7 +78,6 @@ def process_audio():
     decision_payload = analyze_and_generate_reply(saved_input_path, character=character_name)
     
     return jsonify(decision_payload)
-
 
 
 @app.route("/stream-audio/<filename>")
