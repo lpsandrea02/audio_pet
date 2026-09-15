@@ -284,17 +284,20 @@ async function sendToFlaskBackend(blob) {
         const data = await response.json();
         
         lastResponseAudioUrl = data.audio_url;
-// The backend can pick a completely different skin/emotion if it wants to switch characters dynamically!
-currentSkin = data.skin || currentSkin;
-currentEmotion = data.emotion || currentEmotion;
+        currentSkin = data.skin || currentSkin; 
+        currentEmotion = data.emotion || currentEmotion;
+        
+        playBtn.disabled = false;
+        statusText.textContent = "Status: Processing complete. Autoplaying response...";
+        renderFrame();
 
-playBtn.disabled = false;
-statusText.textContent = "Status: Processing complete. Ready.";
-renderFrame();} 
-catch (err) {
-    console.error(err);
-    statusText.textContent = "Status: Endpoint error.";
-}
+        // --- NEW LINE: Trigger immediate playback automatically ---
+        triggerAudioPlayback();
+
+    } catch (err) {
+        console.error(err);
+        statusText.textContent = "Status: Endpoint error.";
+    }
 }
 
 playBtn.addEventListener("click", () => {
@@ -310,6 +313,31 @@ playBtn.addEventListener("click", () => {
     audio.play();
 });
 
+// Universal playback engine function shared by both autoplay and the replay button
+function triggerAudioPlayback() {
+    if (!lastResponseAudioUrl) return;
+    
+    const audio = new Audio(lastResponseAudioUrl);
+    isSpeaking = true;
+    statusText.textContent = "Status: Character speaking...";
+    
+    audio.onended = () => {
+        isSpeaking = false;
+        statusText.textContent = "Status: Idle";
+    };
+    
+    // Play sound (Modern browsers allow autoplay here because it is a direct result of a user click action)
+    audio.play().catch(err => {
+        console.warn("Autoplay blocked by browser policy. Please click 'Play Last Reply' manually.", err);
+        statusText.textContent = "Status: Autoplay blocked. Use manual button.";
+        isSpeaking = false;
+    });
+}
+
+// Keep standard click event listener targeting the shared engine
+playBtn.addEventListener("click", () => {
+    triggerAudioPlayback();
+});
 
 </script>
 </body>
