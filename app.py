@@ -1,4 +1,4 @@
-import os, shutil
+import os
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from audio_tools import normalize_audio, detect_melody, synthesise_output, determine_emotion
 
@@ -20,9 +20,9 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
 
     Runs the full Audiopet audio pipeline on a user recording:
     normalisation, melody detection, emotion decision, and response
-    synthesis in the selected character's voice. If the detected
-    melody is too short to synthesise (ValueError), falls back to
-    copying the character's preset confused response file.
+    synthesis in the selected character's voice. Invalid or empty
+    recordings are handled inside the audio_tools pipeline, which
+    synthesises a preset confused noise in that case.
 
     Args:
         input_wav_path (str): Path to the uploaded user recording (.wav).
@@ -46,24 +46,11 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
 
     emotion = determine_emotion(note_sequence, input_wav_path)
 
-    try:
-        synthesise_output(note_sequence, 
-                        output_filename=output_audio_path, 
-                        sample_rate=44100,
-                        character=character,
-                        emotion=emotion) 
-    except ValueError: # When audio is too short for melody log 
-        # Note sequence: 'D5', 'E5', 'F#5', 'G#5'. 
-        # Directly copy preexisting confused music files for convenience, but can replace this with synthesising the melody sequence instead
-        fallback_source = f"data/responses/{character}_confused.wav"
-        print(f"Warning: melody_log is empty! Attempting to copy preset fallback file: '{fallback_source}'")
-        try:
-            shutil.copy(fallback_source, output_audio_path)
-            print(f"Dynamic fallback copied successfully -> '{output_audio_path}'")
-            emotion = "confused"
-        except Exception as e:
-            print(f"Error copying fallback file: {e}")
-
+    emotion = synthesise_output(note_sequence, 
+                    output_filename=output_audio_path, 
+                    sample_rate=44100,
+                    character=character,
+                    emotion=emotion) 
     
     return {
         "audio_url": f"/stream-audio/{output_audio_filename}", 

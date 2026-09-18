@@ -42,6 +42,15 @@ EMOTION_PROFILES = {
     'angry':     {'vib_speed': 0,   'vib_depth': 0.0,   'pitch_envelope': 'bark'}
 }
 
+# Preset melody synthesised as a "confused noise" when the detected
+# note sequence is empty or invalid (e.g. the recording was too short).
+CONFUSED_MELODY = [
+    {'pitch': 'D5',  'duration': 0.3},
+    {'pitch': 'E5',  'duration': 0.3},
+    {'pitch': 'F#5', 'duration': 0.3},
+    {'pitch': 'G#5', 'duration': 0.3},
+]
+
 # =====================================================================
 # 1. INPUT MELODY DETECTION 
 # =====================================================================
@@ -112,7 +121,9 @@ def detect_melody(filename):
               (e.g. "D5"), as produced by :func:`midi_to_note_name`.
             - "duration" (float): Note length in seconds, rounded to
               2 decimal places (includes a fixed +0.1s tail).
-        Returns an empty list if no stable note is detected.
+        Returns an empty list if no stable note is detected, or if the
+        file is missing, invalid, or corrupted (fail-safe: any aubio
+        error is caught rather than raised).
     """
     # preferred timing setup
     samplerate = 44100
@@ -121,14 +132,6 @@ def detect_melody(filename):
 
     FRAME_DURATION = hop_size / samplerate
 
-    source = aubio.source(filename, samplerate, hop_size)
-    samplerate = source.samplerate
-
-    pitch_detector = aubio.pitch("yinfast", win_size, hop_size, samplerate)
-    pitch_detector.set_unit("midi") 
-    pitch_detector.set_tolerance(0.5) 
-    pitch_detector.set_silence(-45)
-
     # We will save dictionaries containing: {"pitch": midi_val, "duration": seconds}
     melody_data = []
 
@@ -136,41 +139,55 @@ def detect_melody(filename):
     note_frame_count = 0
     MIN_STABLE_FRAMES = 5  # Filter to ignore brief accidental noise artifacts
 
-    while True:
-        samples, read = source()
-        pitch = pitch_detector(samples)
-        confidence = pitch_detector.get_confidence()
-        
-        # Bypasses NumPy 1.25 warning safely
-        raw_pitch_val = pitch
-        detected_pitch = int(np.round(raw_pitch_val)) if confidence > 0.5 else 0
+    try:
+        source = aubio.source(filename, samplerate, hop_size)
+        samplerate = source.samplerate
 
-        if detected_pitch == current_note:
-            # Note is being held, increment frame duration counter
-            note_frame_count += 1
-        else:
-            # The note changed or silence occurred. 
-            # Save the previous note if it lasted long enough to be real.
-            if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
-                duration_secs = note_frame_count * FRAME_DURATION + 0.1
-                melody_data.append({
-                    "pitch": midi_to_note_name(current_note),
-                    "duration": round(duration_secs, 2)
-                })
-                
-            # Reset counters to evaluate the brand new note pitch
-            current_note = detected_pitch
-            note_frame_count = 1
+        pitch_detector = aubio.pitch("yinfast", win_size, hop_size, samplerate)
+        pitch_detector.set_unit("midi") 
+        pitch_detector.set_tolerance(0.5) 
+        pitch_detector.set_silence(-45)
+
+        while True:
+            samples, read = source()
+            pitch = pitch_detector(samples)
+            confidence = pitch_detector.get_confidence()
             
-        if read < hop_size:
-            # Catch the very last trailing note of the audio file before ending
-            if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
-                duration_secs = note_frame_count * FRAME_DURATION + 0.1
-                melody_data.append({
-                    "pitch": midi_to_note_name(current_note),
-                    "duration": round(duration_secs, 2)
-                })
-            break
+            # Bypasses NumPy 1.25 warning safely
+            raw_pitch_val = pitch
+            detected_pitch = int(np.round(raw_pitch_val)) if confidence > 0.5 else 0
+
+            if detected_pitch == current_note:
+                # Note is being held, increment frame duration counter
+                note_frame_count += 1
+            else:
+                # The note changed or silence occurred. 
+                # Save the previous note if it lasted long enough to be real.
+                if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
+                    duration_secs = note_frame_count * FRAME_DURATION + 0.1
+                    melody_data.append({
+                        "pitch": midi_to_note_name(current_note),
+                        "duration": round(duration_secs, 2)
+                    })
+                    
+                # Reset counters to evaluate the brand new note pitch
+                current_note = detected_pitch
+                note_frame_count = 1
+                
+            if read < hop_size:
+                # Catch the very last trailing note of the audio file before ending
+                if current_note > 0 and note_frame_count >= MIN_STABLE_FRAMES:
+                    duration_secs = note_frame_count * FRAME_DURATION + 0.1
+                    melody_data.append({
+                        "pitch": midi_to_note_name(current_note),
+                        "duration": round(duration_secs, 2)
+                    })
+                break
+    except Exception as e:
+        # Invalid, truncated, corrupted, or missing audio must never
+        # crash the pipeline; report and continue with whatever (if
+        # anything) was detected before the failure.
+        print(f"⚠️ Melody detection failed for '{filename}': {e}. Returning no notes.")
 
     for item in melody_data:
         print(f"🎵 Note: {item['pitch']:<5} | ⏱️ Duration: {item['duration']} seconds")
@@ -331,8 +348,9 @@ def synthesise_output(melody_log,
 
     Renders each note of the melody log as a tone with the chosen
     character voice and emotional delivery, concatenates them, and
-    writes the result as a 16-bit PCM .wav file. Raises ValueError
-    when the melody log is empty (nothing to concatenate).
+    writes the result as a 16-bit PCM .wav file. If the melody log is
+    empty or None, the preset confused noise (``CONFUSED_MELODY``) is
+    synthesised with the "confused" emotion instead.
 
     Parameters:
     - melody_log (list[dict]): List of {"pitch": str/int, "duration": float} dicts.
@@ -347,11 +365,19 @@ def synthesise_output(melody_log,
       Defaults to "none".
 
     Returns:
-        None. Writes the rendered audio to ``output_filename``.
+        str: The emotion actually used for the synthesis, so callers
+        can detect when the confused-noise fallback fired ("confused"
+        instead of the passed-in emotion).
 
     Raises:
-        ValueError: If ``melody_log`` is empty.
+        ValueError: If a non-empty ``melody_log`` fails to render.
     """
+    # Fail-safe: empty or missing melody log -> synthesise the preset
+    # confused noise instead of crashing on an empty note sequence.
+    if not melody_log:
+        print("melody_log is empty, generating confused noise…")
+        melody_log = CONFUSED_MELODY
+        emotion = "confused"
         
     voice_cfg = VOICE_PROFILES.get(character, VOICE_PROFILES['default_cat'])
     emotion_cfg = EMOTION_PROFILES.get(emotion, EMOTION_PROFILES['none'])
@@ -379,7 +405,8 @@ def synthesise_output(melody_log,
         
     audio_int16 = np.int16(audio_signal * 32767)
     wavfile.write(output_filename, sample_rate, audio_int16)
-    print(f"💾 Rendered -> {output_filename} ({character} + {emotion})")    
+    print(f"💾 Rendered -> {output_filename} ({character} + {emotion})")
+    return emotion
 
 def _get_raw_audio_duration(input_path):
     """
