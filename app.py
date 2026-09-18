@@ -11,12 +11,30 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESPONSE_FOLDER, exist_ok=True)
 
 # =====================================================================
-# 1. PLACEHOLDER: INSERT YOUR CUSTOM AUDIO & DECISION LOGIC HERE
+# 1. AUDIO & DECISION LOGIC
 # =====================================================================
 def analyze_and_generate_reply(input_wav_path, character="default_cat"):
     """
-    [YOUR HOOK] Core logic block. Process the received audio file 
+    Core logic block. Process the received audio file
     and decide what response file, skin, and emotion to emit back.
+
+    Runs the full Audiopet audio pipeline on a user recording:
+    normalisation, melody detection, emotion decision, and response
+    synthesis in the selected character's voice. If the detected
+    melody is too short to synthesise (ValueError), falls back to
+    copying the character's preset confused response file.
+
+    Args:
+        input_wav_path (str): Path to the uploaded user recording (.wav).
+        character (str, optional): Character name matching a key in
+            ``VOICE_PROFILES``. Defaults to "default_cat".
+
+    Returns:
+        dict: Payload for the frontend with keys:
+            - "audio_url" (str): URL from which the reply .wav can be streamed.
+            - "skin" (str): The active character name.
+            - "emotion" (str): Emotion the reply was delivered in
+              (e.g. "happy", "confused").
     """
     print(f"-> Flask processing payload saved at: {input_wav_path}")
 
@@ -58,15 +76,32 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
 # =====================================================================
 @app.route("/")
 def index():
-    """Renders your main HTML interface file."""
+    """Render and serve the main HTML interface (templates/index.html).
+
+    Returns:
+        str: Rendered HTML of the Audiopet interaction interface.
+    """
     return render_template("index.html")
 
 @app.route("/api/process-audio", methods=["POST"])
-@app.route("/api/process-audio", methods=["POST"])
 def process_audio():
     """
-    Unified route handling data uploads. 
+    Unified route handling data uploads.
     Accepts browser multi-part forms containing audio binary data.
+
+    Expects a multipart/form-data POST with:
+        - "file": the recorded audio binary (.wav).
+        - "current_skin" (optional): active character name; defaults
+          to "default_cat" if blank.
+        - "current_emotion" (optional): frontend-reported emotion;
+          defaults to "happy" if blank.
+
+    Returns:
+        tuple: A ``(jsonify(payload), status_code)`` pair.
+            On success (200), the payload is the decision dictionary
+            from :func:`analyze_and_generate_reply`.
+            On failure (400), the payload is ``{"error": "<message>"}``
+            when the file payload or filename is missing.
     """
     if "file" not in request.files:
         return jsonify({"error": "No file payload detected"}), 400
@@ -95,6 +130,13 @@ def process_audio():
 def stream_audio(filename):
     """
     Serves the output wave files safely from the data storage directory.
+
+    Args:
+        filename (str): Name of the .wav file inside the responses
+            folder to stream (e.g. "system_reply.wav").
+
+    Returns:
+        Response: The audio file stream with mimetype "audio/wav".
     """
     return send_from_directory(RESPONSE_FOLDER, filename, mimetype="audio/wav")
 

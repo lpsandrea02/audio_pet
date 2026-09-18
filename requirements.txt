@@ -1,0 +1,4 @@
+flask
+aubio
+scipy
+librosa

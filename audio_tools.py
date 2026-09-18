@@ -1,3 +1,23 @@
+"""Audio processing tools for the Audiopet companion.
+
+This module implements the full audio pipeline of the Audiopet:
+
+1. Input melody detection: volume normalisation, pitch tracking with
+   aubio, and melody extraction from raw user recordings.
+2. Response synthesis: rendering a detected melody back as a .wav file
+   in one of the predefined character voices (``VOICE_PROFILES``) and
+   emotional deliveries (``EMOTION_PROFILES``).
+3. Behaviour decision logic: choosing the emotion used for the response
+   based on the detected melody and the raw input timeline.
+
+Constants:
+    VOICE_PROFILES (dict): Mapping from character name to voice synthesis
+        settings (wave_type, pitch_scale, sub_octave, jitter,
+        ring_mod_freq, animal_mod, gain).
+    EMOTION_PROFILES (dict): Mapping from emotion name to delivery
+        settings (vib_speed, vib_depth, pitch_envelope).
+"""
+
 import aubio
 import numpy as np
 import scipy.io.wavfile as wavfile
@@ -27,7 +47,20 @@ EMOTION_PROFILES = {
 # =====================================================================
 
 def normalize_audio(input_wav, output_wav):
-    """Boosts the audio file volume to its mathematical maximum limit."""
+    """
+    Boosts the audio file volume to its mathematical maximum limit.
+
+    Loads the input recording, peak-normalises it so the loudest
+    sample reaches 1.0 (0 dBFS), and writes it back as 16-bit PCM.
+
+    Args:
+        input_wav (str): Path to the source audio file.
+        output_wav (str): Path where the normalised .wav is written.
+
+    Returns:
+        None. Writes the normalised audio to ``output_wav``. Prints a
+        warning and writes nothing if the input is completely silent.
+    """
     data, sr = librosa.load(input_wav, sr=None)
     
     # Convert integer PCM data to float for calculations
@@ -48,11 +81,39 @@ def normalize_audio(input_wav, output_wav):
 
 
 def midi_to_note_name(midi_num):
+    """
+    Converts a MIDI note number to standard scientific pitch notation.
+
+    Args:
+        midi_num (int): MIDI note number (e.g. 69 for A4).
+
+    Returns:
+        str: Note name in the form ``"<letter><accidental><octave>"``
+        (e.g. "A4", "C#3").
+    """
     notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     octave = (midi_num // 12) - 1
     return f"{notes[midi_num % 12]}{octave}"
 
 def detect_melody(filename):
+    """
+    Detects the melody sequence of a recording using aubio pitch tracking.
+
+    Streams the audio through the "yinfast" pitch detector frame by
+    frame, groups consecutive frames of the same pitch into notes, and
+    filters out blips shorter than ``MIN_STABLE_FRAMES`` frames.
+
+    Args:
+        filename (str): Path to the audio file to analyse.
+
+    Returns:
+        list[dict]: Detected melody, one dict per note:
+            - "pitch" (str): Note name in scientific pitch notation
+              (e.g. "D5"), as produced by :func:`midi_to_note_name`.
+            - "duration" (float): Note length in seconds, rounded to
+              2 decimal places (includes a fixed +0.1s tail).
+        Returns an empty list if no stable note is detected.
+    """
     # preferred timing setup
     samplerate = 44100
     hop_size = 1024  
@@ -117,7 +178,16 @@ def detect_melody(filename):
     return melody_data
 
 def midi_to_freq(midi_num):
-    """Converts a MIDI note number to its frequency in Hertz."""
+    """
+    Converts a MIDI note number to its frequency in Hertz.
+
+    Args:
+        midi_num (int or float): MIDI note number (69 = A4 = 440 Hz).
+
+    Returns:
+        float: Frequency of the note in Hz using equal temperament
+        tuned to A4 = 440 Hz.
+    """
     return 440.0 * (2.0 ** ((midi_num - 69) / 12.0))
 
 
@@ -126,7 +196,19 @@ def midi_to_freq(midi_num):
 # =====================================================================
 
 def _get_frequency(note_str):
-    """Calculates exact frequency for standard notation strings like 'C5' or 'F#4'."""
+    """
+    Calculates exact frequency for standard notation strings like 'C5' or 'F#4'.
+
+    Args:
+        note_str (str, int, or float): Note in scientific pitch notation
+            (e.g. "C5", "F#4"), or a numeric frequency in Hz, or one of
+            the rest markers "rest", "", "0".
+
+    Returns:
+        float: Frequency of the note in Hz (equal temperament,
+        A4 = 440 Hz), the number itself if numeric input was given,
+        or 0.0 for rests and unparseable input.
+    """
     if isinstance(note_str, (int, float)):
         return float(note_str)
     note_str = str(note_str).strip()
@@ -144,7 +226,32 @@ def _get_frequency(note_str):
 
 
 def _generate_tone_with_emotion(base_freq, duration, voice_cfg, emotion_cfg, is_last_note, sample_rate):
-    """Synthesizes a voice wave block that matches the exact original duration."""
+    """
+    Synthesizes a voice wave block that matches the exact original duration.
+
+    Renders one note as a waveform shaped by the character voice
+    (timbre, sub-octave, jitter, ring modulation, animal pitch
+    overrides) and the emotion delivery (vibrato and pitch envelope),
+    then applies a short legato attack/release window.
+
+    Args:
+        base_freq (float): Fundamental frequency of the note in Hz
+            (0.0 produces silence for the given duration).
+        duration (float): Note duration in seconds; the output block
+            always contains exactly ``sample_rate * duration`` samples.
+        voice_cfg (dict): Voice settings from ``VOICE_PROFILES`` for
+            the active character.
+        emotion_cfg (dict): Emotion settings from ``EMOTION_PROFILES``
+            for the active emotion.
+        is_last_note (bool): True if this is the final note of the
+            melody (enables the 'question' pitch envelope tail).
+        sample_rate (int): Output sample rate in Hz.
+
+    Returns:
+        numpy.ndarray: Float waveform samples for the note, scaled by
+        the voice's gain, with the same length in seconds as
+        ``duration``.
+    """
     if base_freq == 0:
         return np.zeros(int(sample_rate * duration))
         
@@ -221,10 +328,29 @@ def synthesise_output(melody_log,
                       emotion="none"):
     """
     Synthesizes structural .wav sequences from logs incorporating separate character and emotional modifiers.
-    
+
+    Renders each note of the melody log as a tone with the chosen
+    character voice and emotional delivery, concatenates them, and
+    writes the result as a 16-bit PCM .wav file. Raises ValueError
+    when the melody log is empty (nothing to concatenate).
+
     Parameters:
-    - melody_log: List of {"pitch": str/int, "duration": float} dicts.
-    - emotion: 'none', 'happy', 'sad', 'confused', or 'angry'.
+    - melody_log (list[dict]): List of {"pitch": str/int, "duration": float} dicts.
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "synthesized_melody.wav".
+    - sample_rate (int, optional): Output sample rate in Hz.
+      Defaults to 44100.
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+    - emotion (str, optional): One of 'none', 'happy', 'sad',
+      'confused', or 'angry'; falls back to "none" if unknown.
+      Defaults to "none".
+
+    Returns:
+        None. Writes the rendered audio to ``output_filename``.
+
+    Raises:
+        ValueError: If ``melody_log`` is empty.
     """
         
     voice_cfg = VOICE_PROFILES.get(character, VOICE_PROFILES['default_cat'])
@@ -259,6 +385,15 @@ def _get_raw_audio_duration(input_path):
     """
     Extracts the duration (in seconds) from a raw audio input.
     Accepts either a string file path or a bytes/file-like object.
+
+    Args:
+        input_path (str, bytes, or file-like): Path to a .wav file,
+            raw .wav bytes, or an in-memory stream readable by
+            ``wave.open``.
+
+    Returns:
+        float: Audio duration in seconds, or 0.0 if the audio
+        properties could not be read.
     """
     try:
         # If it's a file path string
@@ -278,12 +413,25 @@ def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
     """
     Determines the character's emotion string by analyzing the melody log structure 
     and the real timeline of the raw input audio.
-    
+
+    First checks for a timeline mismatch: if the total detected melody
+    duration is under 75% of the raw recording length, the emotion is
+    forced to "confused". Otherwise, an emotion is drawn at random
+    from the given choices with the given probability weights.
+
     Parameters:
-    - melody_log: List of dicts, e.g., [{"pitch": "C5", "duration": 0.25}, ...]
-    - input_path: A file path string (e.g., "recording.wav") OR raw wav bytes.
-    - choices: List of available emotion strings.
-    - probabilities: List of float weights matching the choices.
+    - melody_log (list[dict]): List of dicts, e.g.,
+      [{"pitch": "C5", "duration": 0.25}, ...]
+    - input_path (str or bytes): A file path string
+      (e.g. "recording.wav") OR raw wav bytes.
+    - choices (list[str], optional): List of available emotion strings.
+      Defaults to ["none", "happy", "sad", "angry"].
+    - probabilities (list[float], optional): List of float weights
+      matching the choices. Defaults to [0.70, 0.30, 0.00, 0.00].
+
+    Returns:
+        str: The chosen emotion, either "confused" (timeline mismatch)
+        or one of ``choices`` sampled according to ``probabilities``.
     """
     # Predict melody duration by summing up note lengths inside the log
     predicted_duration = sum(step.get("duration", 0.0) for step in melody_log)
