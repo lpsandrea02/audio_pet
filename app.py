@@ -1,6 +1,7 @@
 import os
 from flask import Flask, jsonify, render_template, request, send_from_directory
-from audio_tools import normalize_audio, detect_melody, synthesise_output, determine_emotion
+from audio_tools import (normalize_audio, detect_melody, synthesise_output,
+                         determine_emotion, generate_click_noise)
 
 app = Flask(__name__)
 
@@ -111,6 +112,50 @@ def process_audio():
     decision_payload = analyze_and_generate_reply(saved_input_path, character=character_name)
     
     return jsonify(decision_payload)
+
+
+@app.route("/api/character-click", methods=["POST"])
+def character_click():
+    """
+    Handles pokes on the character sprite in the web app interface.
+
+    Expects a POST form with:
+        - "current_skin" (optional): active character name; defaults
+          to "default_cat" if blank.
+        - "click_count" (optional): how many times the user has poked
+          the character; defaults to 0 if blank or unparseable.
+
+    Synthesises a happy noise (or a forced angry noise once the user
+    clicks too many times) into data/responses/system_noise.wav. This
+    file is deliberately separate from system_reply.wav, which stays
+    reserved for direct user-to-audiopet interactions.
+
+    Returns:
+        Response: JSON payload with keys:
+            - "audio_url" (str): URL of the click noise .wav.
+            - "skin" (str): The active character name.
+            - "emotion" (str): "happy" or "angry".
+    """
+    character_name = request.form.get("current_skin", "default_cat")
+    try:
+        click_count = int(request.form.get("click_count", 0))
+    except (TypeError, ValueError):
+        click_count = 0
+
+    noise_audio_filename = "system_noise.wav"
+    noise_audio_path = os.path.join(RESPONSE_FOLDER, noise_audio_filename)
+
+    emotion = generate_click_noise(
+        character=character_name,
+        click_count=click_count,
+        output_filename=noise_audio_path
+    )
+
+    return jsonify({
+        "audio_url": f"/stream-audio/{noise_audio_filename}",
+        "skin": character_name,
+        "emotion": emotion
+    })
 
 
 @app.route("/stream-audio/<filename>")

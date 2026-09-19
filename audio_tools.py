@@ -16,6 +16,11 @@ Constants:
         ring_mod_freq, animal_mod, gain).
     EMOTION_PROFILES (dict): Mapping from emotion name to delivery
         settings (vib_speed, vib_depth, pitch_envelope).
+    HAPPY_NOISE_MELODY / ANGRY_NOISE_MELODY (list): Preset note
+        sequences synthesised when the user pokes the character on the
+        web app (rendered into system_noise.wav, never system_reply.wav).
+    CLICK_NOISE_ANGER_THRESHOLD (int): Click count at which the
+        click-noise draw is replaced by a forced angry noise.
 """
 
 import aubio
@@ -54,6 +59,31 @@ CONFUSED_MELODY = [
     {'pitch': 'F#5', 'duration': 0.3},
     {'pitch': 'G#5', 'duration': 0.3},
 ]
+
+# Preset melodies synthesised as "click noises" when the user pokes the
+# Audiopet character on the web app. Most clicks produce a happy noise;
+# once the click count reaches CLICK_NOISE_ANGER_THRESHOLD the pet gets
+# annoyed and an angry noise is forced instead. Click noises are always
+# rendered into a separate system_noise.wav so the system_reply.wav file
+# stays reserved for direct user-to-audiopet interactions.
+HAPPY_NOISE_MELODY = [
+    {'pitch': 'C#5', 'duration': 0.2},
+    {'pitch': 'F5',  'duration': 0.2},
+    {'pitch': 'F#5', 'duration': 0.2},
+    {'pitch': 'G#5', 'duration': 0.2},
+    {'pitch': 'C#6', 'duration': 0.35},
+]
+
+ANGRY_NOISE_MELODY = [
+    {'pitch': 'F5',  'duration': 0.18},
+    {'pitch': 'F#5', 'duration': 0.18},
+    {'pitch': 'F5',  'duration': 0.18},
+    {'pitch': 'F#5', 'duration': 0.18},
+]
+
+# Number of character clicks after which the random draw is abandoned
+# and an angry click noise is forced instead.
+CLICK_NOISE_ANGER_THRESHOLD = 5
 
 # =====================================================================
 # 1. INPUT MELODY DETECTION 
@@ -589,3 +619,72 @@ def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
     # downstream dict lookups (EMOTION_PROFILES, Flask JSON payload)
     # behave like ordinary strings.
     return str(np.random.choice(choices, p=probabilities))
+
+
+def determine_noise_emotion(click_count):
+    """
+    Determines which click noise the Audiopet makes when the user pokes
+    the character on the web app.
+
+    Uses the same weighted ``np.random.choice`` probability structure as
+    the standard responses in :func:`determine_emotion`, restricted to
+    the noise choices: while the pet has not been over-clicked the draw
+    is 0.70 happy / 0.30 angry. Once ``click_count`` reaches
+    ``CLICK_NOISE_ANGER_THRESHOLD`` the random draw is abandoned and an
+    angry noise is forced.
+
+    Parameters:
+    - click_count (int): How many times the user has poked the
+      character (the frontend counts consecutive clicks).
+
+    Returns:
+        str: "happy" or "angry".
+    """
+    if click_count >= CLICK_NOISE_ANGER_THRESHOLD:
+        print(f"😠 Clicked {click_count} times! The Audiopet is fed up.")
+        return "angry"
+
+    choices =       ["happy", "angry"]
+    probabilities = [0.70,     0.30]
+
+    # Same random probability structure as determine_emotion(): a plain
+    # np.random.choice, coerced to str for downstream dict lookups.
+    return str(np.random.choice(choices, p=probabilities))
+
+
+def generate_click_noise(character="default_cat", click_count=0,
+                         output_filename="system_noise.wav"):
+    """
+    Synthesises the click noise for a poke on the character and writes
+    it to a dedicated noise file.
+
+    Decides the noise emotion via :func:`determine_noise_emotion` (happy
+    draw, forced angry once over-clicked), selects the matching preset
+    melody (``HAPPY_NOISE_MELODY`` / ``ANGRY_NOISE_MELODY``), and renders
+    it in the character's voice. Unlike the standard response pipeline,
+    the result must never be written to ``system_reply.wav``: that file
+    is reserved for direct user-to-audiopet interactions, so callers
+    pass a separate path (e.g. ``data/responses/system_noise.wav``).
+
+    Parameters:
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+    - click_count (int, optional): How many times the user has poked
+      the character. Defaults to 0.
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "system_noise.wav".
+
+    Returns:
+        str: The noise emotion actually synthesised ("happy" or
+        "angry"), for the frontend animation.
+    """
+    emotion = determine_noise_emotion(click_count)
+    melody_log = (HAPPY_NOISE_MELODY if emotion == "happy"
+                  else ANGRY_NOISE_MELODY)
+
+    synthesise_output(melody_log,
+                      output_filename=output_filename,
+                      sample_rate=44100,
+                      character=character,
+                      emotion=emotion)
+    return emotion

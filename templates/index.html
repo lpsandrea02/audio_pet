@@ -74,6 +74,8 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            cursor: pointer;
+            user-select: none;
         }
         .controls {
             display: flex;
@@ -189,6 +191,13 @@ let mediaRecorder;
 let audioChunks = [];
 let lastResponseAudioUrl = "";
 
+// Clickable character state: consecutive poke counter + the currently
+// playing click-noise audio element. Click noises are deliberately
+// NEVER cached into lastResponseAudioUrl so the "Play Last Reply"
+// button can never replay system_noise.wav.
+let clickCount = 0;
+let noiseAudio = null;
+
 // Element Selectors
 const selectionScreen = document.getElementById("selection-screen");
 const mainScreen = document.getElementById("main-screen");
@@ -221,6 +230,7 @@ function selectCharacter(skinKey) {
     currentSkin = skinKey;
     currentEmotion = "happy"; // resets to happy on choice
     isSpeaking = false;
+    clickCount = 0; // fresh pet, fresh patience
     
     selectionScreen.style.display = "none";
     mainScreen.style.display = "block";
@@ -266,6 +276,7 @@ recordBtn.addEventListener("click", async () => {
         statusText.textContent = "Status: Transmitting audio...";
     } else {
         audioChunks = [];
+        clickCount = 0; // a direct interaction calms the pet down
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaRecorder = new MediaRecorder(stream);
         
@@ -369,6 +380,66 @@ function triggerAudioPlayback() {
 playBtn.addEventListener("click", () => {
     triggerAudioPlayback();
 });
+
+// =====================================================================
+// 5. CLICKABLE CHARACTER (POKE -> CLICK NOISE)
+// =====================================================================
+// Poking the character asks the backend to synthesise a happy noise
+// (or a forced angry noise once the pet has been poked too many times)
+// into system_noise.wav. The noise is played immediately from the
+// user-gesture click, but is never cached into lastResponseAudioUrl,
+// so the "Play Last Reply" button cannot replay it.
+asciiDisplay.addEventListener("click", async () => {
+    clickCount += 1;
+    statusText.textContent = "Status: Poked!";
+
+    const formData = new FormData();
+    formData.append("current_skin", currentSkin);
+    formData.append("click_count", clickCount);
+
+    try {
+        const response = await fetch("/api/character-click", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+        playClickNoise(data.audio_url + "?t=" + new Date().getTime(),
+                       data.emotion);
+    } catch (err) {
+        console.error("Click noise transmission breakdown:", err);
+        statusText.textContent = "Status: Endpoint error.";
+    }
+});
+
+function playClickNoise(url, emotion) {
+    // Cut off any previously playing noise so rapid pokes don't stack
+    if (noiseAudio) {
+        noiseAudio.pause();
+    }
+
+    noiseAudio = new Audio(url);
+    const prevEmotion = currentEmotion;
+    currentEmotion = emotion || prevEmotion;
+    isSpeaking = true;
+    statusText.textContent = "Status: Character reacting...";
+    renderFrame();
+
+    noiseAudio.onended = () => {
+        isSpeaking = false;
+        currentEmotion = prevEmotion;
+        statusText.textContent = "Status: Idle";
+    };
+
+    // Autoplay is allowed here because playback originates directly
+    // from the user's click on the character
+    noiseAudio.play().catch(err => {
+        console.warn("Noise playback blocked by browser policy.", err);
+        isSpeaking = false;
+        currentEmotion = prevEmotion;
+        statusText.textContent = "Status: Autoplay blocked.";
+    });
+}
 
 
 </script>
