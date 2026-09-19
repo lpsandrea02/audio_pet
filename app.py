@@ -3,7 +3,11 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from audio_tools import (normalize_audio, detect_melody, synthesise_output,
                          determine_emotion, generate_click_noise,
                          generate_idle_noise, get_idle_noise_delay,
-                         add_to_memory, short_term_memory)
+                         add_to_memory, short_term_memory,
+                         is_user_turn_ended, should_interrupt_angry,
+                         extend_melody_log, generate_interrupt_reply,
+                         generate_interrupt_angry_noise, is_chunk_voiced,
+                         _get_raw_audio_duration)
 
 app = Flask(__name__)
 
@@ -64,6 +68,159 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
         "audio_url": f"/stream-audio/{output_audio_filename}", 
         "skin": character,
         "emotion": emotion
+    }
+
+# =====================================================================
+# 1.5 INTERACTIVE MODE SESSION STATE
+# =====================================================================
+# Full-duplex interactive session: the frontend continuously POSTs short
+# audio chunks while the user is talking; this module-level state tracks
+# the melody accumulated in the current user turn, how much silence has
+# passed since the latest detected note, and how many times the user has
+# interrupted the pet's reply (reset once the angry noise fires).
+interactive_session = {
+    "active": False,
+    "melody_log": [],
+    "silence_seconds": 0.0,
+    "interrupt_count": 0,
+}
+
+
+def reset_interactive_session(active=False):
+    """
+    Resets (and optionally activates) the interactive-mode session.
+
+    Clears the accumulated turn melody, the silence counter, and the
+    interruption counter, setting the session active flag to the given
+    value.
+
+    Args:
+        active (bool, optional): Whether the session should be marked
+            active after the reset. Defaults to False.
+
+    Returns:
+        None.
+    """
+    interactive_session.update(
+        active=active,
+        melody_log=[],
+        silence_seconds=0.0,
+        interrupt_count=0,
+    )
+
+
+def process_interactive_chunk(chunk_wav_path, pet_speaking,
+                              character="default_cat"):
+    """
+    Processes one streamed audio chunk for the interactive session.
+
+    Runs the chunk through the gated detection pipeline: the chunk is
+    normalised, then the WebRTC voice-activity gate
+    (:func:`is_chunk_voiced`) decides whether it is note-analysed at
+    all — unvoiced chunks (background noise, silence) skip melody
+    detection entirely so they cleanly accumulate into the turn-end
+    silence clock. The session state is then updated:
+
+    - Notes detected while the user's turn is active are merged into
+      the running turn melody and reset the silence clock.
+    - Notes detected while the pet is speaking count as an
+      interruption: the interrupt counter is incremented and the
+      previous melody is discarded, so only the new note sequence is
+      synthesised when the next turn ends.
+    - A chunk without detected notes accumulates its decoded duration
+      into the silence clock.
+
+    When the measured silence meets INTERACTIVE_SILENCE_THRESHOLD and
+    at least one note was detected in the turn, the turn ends: if the
+    interrupt count has reached INTERACTIVE_INTERRUPT_ANGER_THRESHOLD
+    the pet renders the forced angry noise (and resets the counter);
+    otherwise it synthesises the accumulated melody in the character's
+    voice and stores it in short-term memory. In both cases the turn
+    melody and silence clock are cleared afterwards.
+
+    Args:
+        chunk_wav_path (str): Path to the saved chunk audio file.
+        pet_speaking (bool): True when the Audiopet's reply audio is
+            currently playing in the frontend.
+        character (str, optional): Character name matching a key in
+            ``VOICE_PROFILES``. Defaults to "default_cat".
+
+    Returns:
+        dict: Chunk result payload with keys:
+            - "notes_detected" (int): Notes found in this chunk.
+            - "total_notes" (int): Notes accumulated in the turn so far.
+            - "interrupted" (bool): True if this chunk was an
+              interruption of the pet's singing.
+            - "interrupt_count" (int): Current interrupt counter.
+            - "turn_ended" (bool): True when the turn ended and a
+              reply was synthesised.
+            - "audio_url" (str or None): Reply/noise stream URL when
+              the turn ended, else None.
+            - "emotion" (str or None): Reply emotion when the turn
+              ended, else None.
+    """
+    boosted_path = os.path.join(UPLOAD_FOLDER,
+                                "interactive_chunk_boosted.wav")
+    normalize_audio(chunk_wav_path, boosted_path)
+
+    # Voice-activity gate: only voiced chunks are note-analysed;
+    # unvoiced chunks skip detection and cleanly accumulate silence.
+    new_notes = (detect_melody(boosted_path)
+                 if is_chunk_voiced(boosted_path) else [])
+
+    state = interactive_session
+    interrupted = False
+
+    if new_notes:
+        if pet_speaking:
+            # Interruption: discard the previous melody, the next
+            # reply synthesises only the new note sequence.
+            interrupted = True
+            state["interrupt_count"] += 1
+            state["melody_log"] = [{**note} for note in new_notes]
+        else:
+            state["melody_log"] = extend_melody_log(state["melody_log"],
+                                                    new_notes)
+        state["silence_seconds"] = 0.0
+    else:
+        chunk_duration = _get_raw_audio_duration(chunk_wav_path)
+        if chunk_duration > 0.0:
+            state["silence_seconds"] += chunk_duration
+
+    turn_ended = (state["active"]
+                  and not pet_speaking
+                  and len(state["melody_log"]) > 0
+                  and is_user_turn_ended(state["silence_seconds"]))
+
+    reply_filename = None
+    emotion = None
+    if turn_ended:
+        turn_melody = state["melody_log"]
+        if should_interrupt_angry(state["interrupt_count"]):
+            reply_filename = "system_interactive_angry.wav"
+            emotion = generate_interrupt_angry_noise(
+                character=character,
+                output_filename=os.path.join(RESPONSE_FOLDER, reply_filename))
+            state["interrupt_count"] = 0
+        else:
+            reply_filename = "system_interactive_reply.wav"
+            emotion = generate_interrupt_reply(
+                turn_melody,
+                output_filename=os.path.join(RESPONSE_FOLDER, reply_filename),
+                character=character)
+            add_to_memory(turn_melody, memory=short_term_memory)
+        state["melody_log"] = []
+        state["silence_seconds"] = 0.0
+
+    return {
+        "notes_detected": len(new_notes),
+        "total_notes": len(state["melody_log"]),
+        "interrupted": interrupted,
+        "interrupt_count": state["interrupt_count"],
+        "turn_ended": turn_ended,
+        "audio_url": (f"/stream-audio/{reply_filename}"
+                      if reply_filename else None),
+        "emotion": emotion,
     }
 
 # =====================================================================
@@ -241,6 +398,85 @@ def idle_delay():
         Response: JSON payload with key "delay" (float seconds).
     """
     return jsonify({"delay": get_idle_noise_delay()})
+
+
+@app.route("/api/interactive-start", methods=["POST"])
+def interactive_start():
+    """
+    Activates the interactive-mode session.
+
+    Resets the module-level session state and marks it active: the
+    frontend can then stream audio chunks via /api/interactive-chunk.
+
+    Returns:
+        Response: JSON payload with key "active" (True).
+    """
+    reset_interactive_session(active=True)
+    return jsonify({"active": True})
+
+
+@app.route("/api/interactive-exit", methods=["POST"])
+def interactive_exit():
+    """
+    Deactivates the interactive-mode session.
+
+    Clears the accumulated melody, silence clock, and interrupt counter
+    and marks the session inactive.
+
+    Returns:
+        Response: JSON payload with key "active" (False).
+    """
+    reset_interactive_session(active=False)
+    return jsonify({"active": False})
+
+
+@app.route("/api/interactive-chunk", methods=["POST"])
+def interactive_chunk():
+    """
+    Handles one streamed audio chunk of the interactive-mode session.
+
+    Expects a multipart/form-data POST with:
+        - "file": the streamed audio chunk binary.
+        - "current_skin" (optional): active character name; defaults
+          to "default_cat" if blank.
+        - "pet_speaking" (optional): "true"/"false" flag reporting
+          whether the Audiopet's reply audio is currently playing.
+
+    The chunk is processed by :func:`process_interactive_chunk`, which
+    accumulates detected notes into the running turn melody, tracks
+    silence, counts interruptions of the pet's singing, and — once the
+    silence threshold is met — synthesises the reply (or the forced
+    angry noise after too many interruptions) into a dedicated
+    interactive file, deliberately separate from system_reply.wav.
+
+    Returns:
+        Response: JSON payload with keys "notes_detected",
+            "total_notes", "interrupted", "interrupt_count",
+            "turn_ended", "audio_url", "emotion", plus "skin".
+            On failure (400): ``{"error": "<message>"}``.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file payload detected"}), 400
+
+    audio_file = request.files["file"]
+    if audio_file.filename == "":
+        return jsonify({"error": "Empty filename property"}), 400
+
+    character_name = request.form.get("current_skin", "default_cat")
+    pet_speaking = str(request.form.get("pet_speaking", "")).lower() == "true"
+
+    if not interactive_session.get("active"):
+        return jsonify({"error": "Interactive mode is not active"}), 409
+
+    saved_chunk_path = os.path.join(UPLOAD_FOLDER,
+                                    "interactive_chunk.wav")
+    audio_file.save(saved_chunk_path)
+
+    chunk_payload = process_interactive_chunk(saved_chunk_path,
+                                              pet_speaking,
+                                              character=character_name)
+    chunk_payload["skin"] = character_name
+    return jsonify(chunk_payload)
 
 
 @app.route("/stream-audio/<filename>")

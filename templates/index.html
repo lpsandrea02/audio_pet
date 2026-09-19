@@ -146,6 +146,15 @@
             font-size: 11px;
             padding: 6px 12px;
         }
+        /* Interactive mode row: settings + interactive buttons side by side */
+        .back-btn-row {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        .back-btn-row .back-btn { margin-top: 0; }
+        button.talking { background-color: #cc241d; color: #fff; }
         /* Settings menu overlay */
         .settings-overlay {
             display: none; /* Controlled via JS */
@@ -200,11 +209,15 @@
     <div id="main-screen" class="character-box">
         <div id="ascii-art" class="ascii-display"></div>
         <div class="controls">
-            <button id="record-btn">Record Input</button>
-            <button id="play-btn" disabled>Play Last Reply</button>
+            <button id="record-btn">◉ ︎Record Input</button>
+            <button id="play-btn" disabled>▶ Play Last Reply</button>
+            <button id="talk-btn" style="display:none">🎤︎ Start Talking</button>
         </div>
         <div id="status" class="status-text">Status: Idle</div>
-        <button id="settings-btn" class="back-btn">⚙ Settings</button>
+        <div class="back-btn-row">
+            <button id="settings-btn" class="back-btn">⚙ Settings</button>
+            <button id="interactive-btn" class="back-btn">✿ Interactive Mode</button>
+        </div>
     </div>
 
     <!-- SETTINGS MENU OVERLAY -->
@@ -313,6 +326,26 @@ let idleTimer = null;
 let idleEnabled = true;     // toggled from the settings menu
 let idleSilenced = false;   // True once the final sad noise has played
 let masterVolume = 1.0;     // controlled from the settings menu
+
+// Interactive mode: full-duplex streaming conversation. While active,
+// the record/play controls are replaced by a single Start Talking /
+// Pause Recording button and audio is streamed to the backend in short
+// chunks for continuous note detection.
+let interactiveMode = false;        // ☁︎ button toggles this
+let streamingActive = false;        // Start Talking / Pause Recording
+let interactiveStream = null;
+let interactiveAudioCtx = null;
+let interactiveSource = null;
+let interactiveProcessor = null;
+let interactiveSilenceGain = null;
+let interactiveReplyAudio = null;   // fallback media-element reply audio
+let interactiveReplySource = null;  // Web Audio reply source (unblocked)
+let interactivePetSpeaking = false; // reply audio currently playing
+let interactiveChunkBuffer = [];    // Float32 blocks for the next chunk
+let interactiveChunkSamples = 0;    // samples per ~0.5s chunk
+let interactiveSendChain = Promise.resolve(); // serialize chunk posts
+let interactivePrevIdleEnabled = true; // idle noises paused in mode
+const INTERACTIVE_CHUNK_SECONDS = 0.5; // streamed chunk length
 
 // Element Selectors
 const selectionScreen = document.getElementById("selection-screen");
@@ -698,6 +731,325 @@ fontSelect.addEventListener("change", () => {
 if (fontSelect.value !== "default") {
     document.body.style.setProperty("--ui-font", fontSelect.value);
 }
+
+// =====================================================================
+// 8. INTERACTIVE MODE (full-duplex streaming conversation)
+// =====================================================================
+// Activating interactive mode hides the record/play controls and shows
+// a single Start Talking / Pause Recording button; the ☁︎ button itself
+// becomes Exit Interactive Mode. While streaming, the microphone PCM is
+// captured continuously and POSTed to the backend as ~0.5s standalone
+// WAV chunks, which are normalised and note-detected server-side. When
+// enough silence passes after the latest detected note the backend
+// renders the accumulated melody and the pet sings it back; if new
+// notes arrive while the pet sings, playback is cut immediately and
+// only the fresh note sequence is synthesised next.
+const interactiveBtn = document.getElementById("interactive-btn");
+const talkBtn = document.getElementById("talk-btn");
+
+interactiveBtn.addEventListener("click", () => {
+    if (!interactiveMode) {
+        enterInteractiveMode();
+    } else {
+        exitInteractiveMode();
+    }
+});
+
+talkBtn.addEventListener("click", () => {
+    if (!interactiveMode) return;
+    if (streamingActive) {
+        pauseInteractiveStreaming();
+    } else {
+        startInteractiveStreaming();
+    }
+});
+
+async function enterInteractiveMode() {
+    interactiveMode = true;
+    interactivePrevIdleEnabled = idleEnabled;
+    idleEnabled = false; // idle noises are paused during the session
+    stopIdleTimer();
+    recordBtn.style.display = "none";
+    playBtn.style.display = "none";
+    talkBtn.style.display = "";
+    interactiveBtn.textContent = "➜] Exit Interactive Mode";
+    statusText.textContent = "Status: Interactive ready! Press Start Talking.";
+    try {
+        await fetch("/api/interactive-start", { method: "POST" });
+    } catch (err) {
+        console.error("Interactive start breakdown:", err);
+    }
+}
+
+async function exitInteractiveMode() {
+    stopInteractiveStreaming();
+    stopInteractiveReply();
+    interactiveMode = false;
+    streamingActive = false;
+    recordBtn.style.display = "";
+    playBtn.style.display = "";
+    talkBtn.style.display = "none";
+    talkBtn.textContent = "🎤︎ Start Talking";
+    talkBtn.classList.remove("talking");
+    interactiveBtn.textContent = "✿ Interactive Mode";
+    statusText.textContent = "Status: Idle";
+    idleEnabled = interactivePrevIdleEnabled;
+    try {
+        await fetch("/api/interactive-exit", { method: "POST" });
+    } catch (err) {
+        console.error("Interactive exit breakdown:", err);
+    }
+    resetIdleCycle();
+}
+
+function stopInteractiveStreaming() {
+    if (interactiveProcessor) {
+        interactiveProcessor.onaudioprocess = null;
+        try { interactiveProcessor.disconnect(); } catch (err) {}
+        interactiveProcessor = null;
+    }
+    if (interactiveSource) {
+        try { interactiveSource.disconnect(); } catch (err) {}
+        interactiveSource = null;
+    }
+    if (interactiveSilenceGain) {
+        try { interactiveSilenceGain.disconnect(); } catch (err) {}
+        interactiveSilenceGain = null;
+    }
+    if (interactiveAudioCtx) {
+        try { interactiveAudioCtx.close(); } catch (err) {}
+        interactiveAudioCtx = null;
+    }
+    if (interactiveStream) {
+        interactiveStream.getTracks().forEach(track => track.stop());
+        interactiveStream = null;
+    }
+    interactiveChunkBuffer = [];
+    interactiveChunkSamples = 0;
+}
+
+// Wraps the PCM samples in a minimal 44-byte header RIFF/WAVE blob so
+// every streamed chunk is a standalone, decodable 16-bit wav file.
+function buildInteractiveWavBlob(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (offset, str) => {
+        for (let i = 0; i < str.length; i++) {
+            view.setUint8(offset + i, str.charCodeAt(i));
+        }
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);              // PCM chunk size
+    view.setUint16(20, 1, true);               // PCM format
+    view.setUint16(22, 1, true);               // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);  // byte rate
+    view.setUint16(32, 2, true);               // block align
+    view.setUint16(34, 16, true);              // bits per sample
+    writeStr(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+}
+
+async function startInteractiveStreaming() {
+    clickCount = 0; // a direct interaction calms the pet down
+
+    // The AudioContext must be created AND resumed synchronously inside
+    // the Start Talking click gesture: once unlocked this way, reply
+    // buffers can be scheduled on it programmatically at any later
+    // time, bypassing the media-element autoplay block entirely.
+    interactiveAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+        await interactiveAudioCtx.resume();
+    } catch (err) {
+        console.warn("AudioContext resume blocked in gesture.", err);
+    }
+
+    try {
+        interactiveStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+        console.error("Microphone access breakdown:", err);
+        try { interactiveAudioCtx.close(); } catch (closeErr) {}
+        interactiveAudioCtx = null;
+        statusText.textContent = "Status: Microphone access denied.";
+        return;
+    }
+
+    interactiveSource = interactiveAudioCtx.createMediaStreamSource(interactiveStream);
+    interactiveProcessor = interactiveAudioCtx.createScriptProcessor(4096, 1, 1);
+    interactiveChunkSamples = Math.floor(
+        interactiveAudioCtx.sampleRate * INTERACTIVE_CHUNK_SECONDS);
+
+    interactiveProcessor.onaudioprocess = (event) => {
+        if (!streamingActive) return;
+        interactiveChunkBuffer.push(
+            new Float32Array(event.inputBuffer.getChannelData(0)));
+        const buffered = interactiveChunkBuffer.reduce(
+            (sum, block) => sum + block.length, 0);
+        if (buffered >= interactiveChunkSamples) {
+            const merged = new Float32Array(buffered);
+            let offset = 0;
+            for (const block of interactiveChunkBuffer) {
+                merged.set(block, offset);
+                offset += block.length;
+            }
+            interactiveChunkBuffer = [];
+            const blob = buildInteractiveWavBlob(
+                merged, interactiveAudioCtx.sampleRate);
+            queueInteractiveChunk(blob);
+        }
+    };
+
+    // ScriptProcessor only fires when connected into the audio graph;
+    // route through a zero-gain node so the mic never feeds back out
+    // of the speakers.
+    interactiveSilenceGain = interactiveAudioCtx.createGain();
+    interactiveSilenceGain.gain.value = 0;
+    interactiveSource.connect(interactiveProcessor);
+    interactiveProcessor.connect(interactiveSilenceGain);
+    interactiveSilenceGain.connect(interactiveAudioCtx.destination);
+
+    streamingActive = true;
+    talkBtn.textContent = "⏸ Pause Recording";
+    talkBtn.classList.add("talking");
+    statusText.textContent = "Status: Listening (Interactive)...";
+}
+
+function pauseInteractiveStreaming() {
+    stopInteractiveStreaming();
+    streamingActive = false;
+    talkBtn.textContent = "🎤︎ Start Talking";
+    talkBtn.classList.remove("talking");
+    statusText.textContent = "Status: Interactive paused.";
+}
+
+// Chunk posts are serialized so responses (turn ends, interrupts)
+// arrive in order and never overlap on the backend.
+function queueInteractiveChunk(blob) {
+    interactiveSendChain = interactiveSendChain
+        .then(() => sendInteractiveChunk(blob))
+        .catch(() => {});
+}
+
+async function sendInteractiveChunk(blob) {
+    const formData = new FormData();
+    formData.append("file", blob, "user_interactive_chunk.wav");
+    formData.append("current_skin", currentSkin);
+    formData.append("pet_speaking",
+                    interactivePetSpeaking ? "true" : "false");
+    try {
+        const response = await fetch("/api/interactive-chunk", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+
+        if (data.interrupted) {
+            // New notes detected while the pet sings: immediately stop
+            // singing and listen to the fresh input (the previous
+            // melody is already discarded server-side).
+            stopInteractiveReply();
+            statusText.textContent = "Status: Listening (Interactive)...";
+            return;
+        }
+        if (data.turn_ended && data.audio_url) {
+            playInteractiveReply(data.audio_url + "?t=" + new Date().getTime(),
+                                 data.emotion);
+        }
+    } catch (err) {
+        console.error("Interactive chunk transmission breakdown:", err);
+    }
+}
+
+function finishInteractiveReply(prevEmotion) {
+    isSpeaking = false;
+    interactivePetSpeaking = false;
+    interactiveReplySource = null;
+    interactiveReplyAudio = null;
+    currentEmotion = prevEmotion;
+    if (streamingActive) {
+        statusText.textContent = "Status: Listening (Interactive)...";
+    } else {
+        statusText.textContent = "Status: Interactive paused.";
+    }
+}
+
+async function playInteractiveReply(url, emotion) {
+    stopInteractiveReply();
+    const prevEmotion = currentEmotion;
+    currentEmotion = emotion || prevEmotion;
+    interactivePetSpeaking = true;
+    isSpeaking = true;
+    statusText.textContent = "Status: Character singing (Interactive)...";
+    renderFrame();
+
+    try {
+        if (!interactiveAudioCtx) throw new Error("No unlocked interactive AudioContext");
+
+        // Fetch + decode + schedule on the unlocked gesture context
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("Reply fetch failed");
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await interactiveAudioCtx.decodeAudioData(arrayBuffer);
+
+        const source = interactiveAudioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        const gain = interactiveAudioCtx.createGain();
+        gain.gain.value = masterVolume;
+        source.connect(gain);
+        gain.connect(interactiveAudioCtx.destination);
+        interactiveReplySource = source;
+        source.onended = () => finishInteractiveReply(prevEmotion);
+        source.start();
+    } catch (err) {
+        console.warn("Web Audio reply playback failed, falling back to media element.", err);
+        // Fallback: the old media-element path (subject to autoplay
+        // policy; only a best-effort backup, e.g. context gone while
+        // a fresh user gesture just happened).
+        interactiveReplyAudio = new Audio(url);
+        interactiveReplyAudio.volume = masterVolume;
+        interactiveReplyAudio.onended = () => finishInteractiveReply(prevEmotion);
+        interactiveReplyAudio.play().catch(playErr => {
+            console.warn("Interactive reply playback blocked by browser policy.", playErr);
+            isSpeaking = false;
+            interactivePetSpeaking = false;
+            currentEmotion = prevEmotion;
+            statusText.textContent = "Status: Autoplay blocked.";
+        });
+    }
+}
+
+function stopInteractiveReply() {
+    if (interactiveReplySource) {
+        const source = interactiveReplySource;
+        interactiveReplySource = null;
+        source.onended = null;
+        try { source.stop(); } catch (err) {}
+    }
+    if (interactiveReplyAudio) {
+        interactiveReplyAudio.pause();
+        interactiveReplyAudio = null;
+    }
+    isSpeaking = false;
+    interactivePetSpeaking = false;
+}
+
+// Swapping characters also leaves interactive mode cleanly
+swapCharacterBtn.addEventListener("click", () => {
+    if (interactiveMode) {
+        exitInteractiveMode();
+    }
+});
 
 </script>
 </body>

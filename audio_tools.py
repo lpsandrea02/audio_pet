@@ -34,6 +34,16 @@ Constants:
         the character emits a final sad noise and then stays silent.
     SAD_NOISE_MELODY (list): Preset note sequence of the final sad
         noise (delivered with the "sad" emotion).
+    INTERACTIVE_SILENCE_THRESHOLD (float): Seconds of silence after the
+        latest detected note that end the user's streaming turn in
+        interactive mode.
+    INTERACTIVE_INTERRUPT_ANGER_THRESHOLD (int): Number of user
+        interruptions after which the Audiopet responds with a forced
+        angry noise instead of a melody.
+    VAD_SAMPLE_RATE / VAD_FRAME_MS (int): Internal sample rate and
+        frame length the WebRTC voice-activity gate runs at.
+    VAD_VOICED_FRAME_RATIO / VAD_AGGRESSIVENESS (float, int): Tunables
+        of the voice-activity gate in front of chunk note detection.
 """
 
 import aubio
@@ -46,6 +56,7 @@ import shutil
 import tempfile
 import warnings
 import wave
+import webrtcvad
 
 VOICE_PROFILES = {
     'default_cat':       {'wave_type': 'triangle', 'pitch_scale': 1.0, 'sub_octave': 0.0, 'jitter': 0.001, 'ring_mod_freq': 0,  'animal_mod': 'cat',  'gain': 0.7},
@@ -421,6 +432,321 @@ def generate_idle_noise(character="default_cat", idle_count=0,
                       character=character,
                       emotion=emotion)
     return emotion, False
+
+# =====================================================================
+# INTERACTIVE MODE (full-duplex streaming conversation)
+# =====================================================================
+
+# Silence (in seconds, controllable) measured after the latest detected
+# note that ends the user's turn: once the streaming loop measures this
+# much silence the Audiopet sings back the accumulated melody.
+INTERACTIVE_SILENCE_THRESHOLD = 1.0
+
+# Number of times the user may interrupt the Audiopet's singing (by
+# producing new notes while it speaks) before it responds with a forced
+# angry noise instead of a melody; the counter resets after it fires.
+INTERACTIVE_INTERRUPT_ANGER_THRESHOLD = 3
+
+# ---- WebRTC voice-activity gate for streamed chunks ----
+
+# Internal sample rate the VAD runs at (WebRTC VAD only supports
+# 8000/16000/32000/48000 Hz; chunks are resampled down to this rate
+# before frame classification).
+VAD_SAMPLE_RATE = 16000
+
+# Length of the frames the VAD classifies (WebRTC VAD only supports
+# 10/20/30 ms frames).
+VAD_FRAME_MS = 30
+
+# Fraction of 30 ms frames a chunk must have flagged as speech for the
+# chunk to count as voiced (lenient default so quiet humming is not
+# dropped; raise it to reject noisier environments).
+VAD_VOICED_FRAME_RATIO = 0.1
+
+# Default VAD aggressiveness (0 least aggressive ... 3 most aggressive
+# noise filtering).
+VAD_AGGRESSIVENESS = 3
+
+
+def _load_resampled_float(input_wav, target_sample_rate=VAD_SAMPLE_RATE):
+    """
+    Loads an audio chunk and resamples it to the VAD sample rate.
+
+    Decodes any container librosa supports (browser uploads may be
+    mislabeled containers) down to mono float samples at
+    ``target_sample_rate``.
+
+    Args:
+        input_wav (str): Path to the audio chunk file.
+        target_sample_rate (int, optional): Sample rate to resample to.
+            Defaults to ``VAD_SAMPLE_RATE``.
+
+    Returns:
+        numpy.ndarray or None: Mono float samples in [-1.0, 1.0] at the
+        target rate, or None when the input is missing, silent-readable
+        as empty, or undecodable (fail-safe for the streaming loop).
+    """
+    try:
+        with warnings.catch_warnings():
+            # Compressed containers decode through audioread's
+            # deprecated fallback; keep the streaming log readable.
+            warnings.simplefilter("ignore", FutureWarning)
+            warnings.simplefilter("ignore", UserWarning)
+            data, sr = librosa.load(input_wav, sr=None, mono=True)
+    except Exception:
+        return None
+
+    data = np.asarray(data, dtype=np.float32)
+    sr = int(sr)
+    if sr != target_sample_rate:
+        try:
+            data = librosa.resample(data, orig_sr=sr,
+                                    target_sr=target_sample_rate)
+        except (TypeError, ValueError):
+            return None
+    return data
+
+
+def is_chunk_voiced(input_wav, aggressiveness=None, voiced_ratio=None):
+    """
+    Decides whether a streamed audio chunk contains voiced activity.
+
+    Used as the gate in front of melody detection during interactive
+    mode: only chunks classified as voiced are note-analysed, while
+    unvoiced chunks (background noise, silence) skip detection so they
+    can cleanly accumulate into the turn-end silence clock. The chunk
+    is resampled to ``VAD_SAMPLE_RATE`` and classified frame by frame
+    with the WebRTC VAD; the chunk counts as voiced when the fraction
+    of speech frames reaches ``voiced_ratio`` (tuned for humming and
+    singing, which are voiced but not fully speech-like).
+
+    Fail-safe behaviour: missing, empty, or undecodable input yields
+    False (the streaming loop treats the chunk as silence) instead of
+    crashing; individual malformed frames are skipped.
+
+    Args:
+        input_wav (str): Path to the audio chunk file.
+        aggressiveness (int, optional): VAD aggressiveness 0-3
+            (3 = most aggressive noise rejection). Defaults to
+            ``VAD_AGGRESSIVENESS``.
+        voiced_ratio (float, optional): Required fraction of voiced
+            30 ms frames, in [0.0, 1.0]. Defaults to
+            ``VAD_VOICED_FRAME_RATIO``.
+
+    Returns:
+        bool: True if the chunk is voiced enough to note-analyse.
+    """
+    if aggressiveness is None:
+        aggressiveness = VAD_AGGRESSIVENESS
+    if voiced_ratio is None:
+        voiced_ratio = VAD_VOICED_FRAME_RATIO
+
+    data = _load_resampled_float(input_wav)
+    if data is None or len(data) == 0:
+        return False
+
+    frame_length = int(VAD_SAMPLE_RATE * VAD_FRAME_MS / 1000)
+    usable_length = len(data) - (len(data) % frame_length)
+    if usable_length < frame_length:
+        return False
+
+    frames = (np.clip(data[:usable_length], -1.0, 1.0)
+              * 32767).astype(np.int16).reshape(-1, frame_length)
+
+    try:
+        vad = webrtcvad.Vad(int(aggressiveness))
+    except (TypeError, ValueError):
+        return False
+
+    voiced_frames = 0
+    for frame in frames:
+        try:
+            if vad.is_speech(frame.tobytes(), VAD_SAMPLE_RATE):
+                voiced_frames += 1
+        except Exception:
+            continue
+
+    total_frames = len(frames)
+    return (voiced_frames / float(total_frames)) >= float(voiced_ratio)
+
+
+def is_user_turn_ended(silence_seconds, threshold=None):
+    """
+    Decides whether the user's streaming turn has ended (they stopped
+    making notes for long enough).
+
+    Interactive mode streams user audio in chunks; after each chunk the
+    caller measures how much silence has passed since the latest
+    detected note. When that silence reaches the threshold the turn is
+    considered over and the Audiopet sings back the melody accumulated
+    so far. Fail-safe: unreadable (None, non-numeric) silence values
+    return False so the turn simply stays active rather than crashing
+    the streaming loop.
+
+    Args:
+        silence_seconds (int or float or any): Seconds of silence since
+            the latest detected note.
+        threshold (int or float, optional): Silence threshold in
+            seconds. Defaults to ``INTERACTIVE_SILENCE_THRESHOLD``.
+
+    Returns:
+        bool: True if the silence meets or exceeds the threshold.
+    """
+    if threshold is None:
+        threshold = INTERACTIVE_SILENCE_THRESHOLD
+
+    if (isinstance(silence_seconds, bool)
+            or not isinstance(silence_seconds, (int, float))):
+        return False
+
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        return False
+
+    return float(silence_seconds) >= threshold
+
+
+def should_interrupt_angry(interrupt_count, threshold=None):
+    """
+    Decides whether the Audiopet is fed up with being interrupted.
+
+    While the user streams audio during the Audiopet's reply, every
+    newly detected note counts as an interruption. Once the count
+    reaches the threshold the random melody response is abandoned and a
+    forced angry noise plays instead; the caller must reset the counter
+    to 0 after it fires. Fail-safe: unreadable counts return False so
+    the streaming loop never crashes.
+
+    Args:
+        interrupt_count (int or float or any): How many times the user
+            has interrupted the Audiopet during the current session.
+        threshold (int, optional): Count at which the angry noise is
+            forced. Defaults to
+            ``INTERACTIVE_INTERRUPT_ANGER_THRESHOLD``.
+
+    Returns:
+        bool: True if the count reaches the anger threshold.
+    """
+    if threshold is None:
+        threshold = INTERACTIVE_INTERRUPT_ANGER_THRESHOLD
+
+    if (isinstance(interrupt_count, bool)
+            or not isinstance(interrupt_count, (int, float))):
+        return False
+
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        return False
+
+    return int(interrupt_count) >= threshold
+
+
+def extend_melody_log(running_log, new_notes):
+    """
+    Merges chunk-detected notes into the running turn melody.
+
+    Each streamed audio chunk may contribute newly detected notes;
+    those notes are appended to the melody accumulated so far in the
+    current user turn. Only valid note sequences are merged (see
+    :func:`_is_valid_melody_log`): malformed or empty chunk notes leave
+    the running melody unchanged, and an invalid running log is treated
+    as empty. The result is a fresh list of per-note copies, so later
+    mutation of either input cannot corrupt the merged melody.
+
+    Args:
+        running_log (list[dict]): Melody accumulated in the current
+            turn, one dict per note:
+            {"pitch": str, "duration": float}.
+        new_notes (list[dict]): Notes detected in the latest audio
+            chunk. Invalid, empty, or None input is ignored.
+
+    Returns:
+        list[dict]: The merged melody log (a new list; inputs are
+        never mutated).
+    """
+    merged = ([{**step} for step in running_log]
+              if _is_valid_melody_log(running_log) else [])
+
+    if not _is_valid_melody_log(new_notes):
+        return merged
+
+    merged.extend({**step} for step in new_notes)
+    return merged
+
+
+def generate_interrupt_reply(melody_log,
+                             output_filename="system_interactive_reply.wav",
+                             character="default_cat"):
+    """
+    Synthesises the Audiopet's interactive-mode reply for a finished
+    user turn and writes it to a dedicated reply file.
+
+    The melody accumulated during the user's streaming turn is rendered
+    in the character's voice with a randomly drawn happy or neutral
+    delivery (same weighted ``np.random.choice`` structure as the rest
+    of the behaviour logic). If the accumulated melody is empty the
+    preset confused noise is synthesised with the "confused" emotion
+    instead (the ``synthesise_output`` fallback), so an
+    invalid/notes-less turn still gets an audible response. The result
+    must never be written to ``system_reply.wav``: that file is
+    reserved for the standard recording pipeline, so callers pass a
+    separate path (e.g. ``data/responses/system_interactive_reply.wav``).
+
+    Parameters:
+    - melody_log (list[dict]): Melody accumulated during the user's
+      turn (as built by :func:`extend_melody_log`). An empty or None
+      log renders the confused noise fallback.
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "system_interactive_reply.wav".
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+
+    Returns:
+        str: The emotion actually used for the synthesis ("happy",
+        "none", or "confused" when the fallback fired).
+    """
+    emotion = str(np.random.choice(["none", "happy"], p=[0.70, 0.30]))
+    return synthesise_output(melody_log,
+                             output_filename=output_filename,
+                             sample_rate=44100,
+                             character=character,
+                             emotion=emotion)
+
+
+def generate_interrupt_angry_noise(
+        character="default_cat",
+        output_filename="system_interactive_angry.wav"):
+    """
+    Synthesises the forced angry noise for too many interruptions and
+    writes it to a dedicated file.
+
+    When the user interrupts the Audiopet's singing more than
+    ``INTERACTIVE_INTERRUPT_ANGER_THRESHOLD`` times during an
+    interactive session, the pet abandons the melody response and
+    instead renders the preset angry noise (``ANGRY_NOISE_MELODY``)
+    with the "angry" emotion. The caller must reset the interrupt
+    counter after this fires. Like the other interactive outputs, the
+    noise is written to its own dedicated file so it never touches
+    ``system_reply.wav``.
+
+    Parameters:
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "system_interactive_angry.wav".
+
+    Returns:
+        str: The emotion actually synthesised ("angry").
+    """
+    synthesise_output(ANGRY_NOISE_MELODY,
+                      output_filename=output_filename,
+                      sample_rate=44100,
+                      character=character,
+                      emotion="angry")
+    return "angry"
+
 
 # =====================================================================
 # 1. INPUT MELODY DETECTION 

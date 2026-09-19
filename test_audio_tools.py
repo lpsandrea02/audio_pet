@@ -1397,6 +1397,386 @@ class TestGenerateIdleNoise(AudioToolsTestCase):
 
 
 # ---------------------------------------------------------------------
+# Interactive mode feature
+# ---------------------------------------------------------------------
+# The interactive-mode API does not exist before the feature is
+# implemented; the imports are guarded so the baseline suite stays
+# runnable in the red phase and the new tests report as "expected
+# failure: not implemented yet" instead of crashing collection.
+try:
+    from audio_tools import (
+        INTERACTIVE_SILENCE_THRESHOLD,
+        INTERACTIVE_INTERRUPT_ANGER_THRESHOLD,
+        is_user_turn_ended,
+        should_interrupt_angry,
+        extend_melody_log,
+        generate_interrupt_reply,
+        generate_interrupt_angry_noise,
+    )
+    INTERACTIVE_API_AVAILABLE = True
+except ImportError:
+    INTERACTIVE_API_AVAILABLE = False
+
+
+INTERACTIVE_API_PENDING = "interactive-mode API not implemented yet"
+
+# Distinct-length melody logs so a rendered wav length reveals which
+# melody was used (they differ from every preset melody length).
+INTERACTIVE_LOG_A = [
+    {"pitch": "C5", "duration": 0.3},
+    {"pitch": "D5", "duration": 0.3},
+]
+INTERACTIVE_LOG_B = [{"pitch": "E5", "duration": 0.45}]
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestInteractiveConstants(unittest.TestCase):
+    """The tunable interactive-mode constants."""
+
+    def test_silence_threshold_is_positive_number(self):
+        self.assertIsInstance(INTERACTIVE_SILENCE_THRESHOLD, (int, float))
+        self.assertGreater(INTERACTIVE_SILENCE_THRESHOLD, 0)
+
+    def test_anger_threshold_is_positive_int(self):
+        self.assertIsInstance(INTERACTIVE_INTERRUPT_ANGER_THRESHOLD, int)
+        self.assertGreater(INTERACTIVE_INTERRUPT_ANGER_THRESHOLD, 0)
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestIsUserTurnEnded(unittest.TestCase):
+    """Silence-threshold gate that ends the user's turn while streaming."""
+
+    def test_silence_below_threshold_not_ended(self):
+        self.assertFalse(is_user_turn_ended(0.0))
+        self.assertFalse(is_user_turn_ended(INTERACTIVE_SILENCE_THRESHOLD / 2))
+
+    def test_silence_at_threshold_is_ended(self):
+        self.assertTrue(is_user_turn_ended(INTERACTIVE_SILENCE_THRESHOLD))
+
+    def test_silence_above_threshold_is_ended(self):
+        self.assertTrue(is_user_turn_ended(INTERACTIVE_SILENCE_THRESHOLD * 3))
+
+    def test_custom_threshold_respected(self):
+        self.assertFalse(is_user_turn_ended(0.5, threshold=1.0))
+        self.assertTrue(is_user_turn_ended(1.0, threshold=1.0))
+        self.assertTrue(is_user_turn_ended(2.0, threshold=1.0))
+
+    def test_none_silence_fail_safe_false(self):
+        # An unreadable silence value must never crash the streaming
+        # loop; the turn simply stays active.
+        self.assertFalse(is_user_turn_ended(None))
+
+    def test_negative_silence_fail_safe_false(self):
+        self.assertFalse(is_user_turn_ended(-1.0))
+
+    def test_non_numeric_silence_fail_safe_false(self):
+        for bad in ("1.0", [1.0], {"s": 1.0}):
+            self.assertFalse(is_user_turn_ended(bad))
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestShouldInterruptAngry(unittest.TestCase):
+    """Interruption counting: too many interrupts force the angry noise."""
+
+    def test_below_threshold_not_angry(self):
+        for count in range(INTERACTIVE_INTERRUPT_ANGER_THRESHOLD):
+            self.assertFalse(should_interrupt_angry(count))
+
+    def test_at_threshold_is_angry(self):
+        self.assertTrue(
+            should_interrupt_angry(INTERACTIVE_INTERRUPT_ANGER_THRESHOLD))
+
+    def test_above_threshold_is_angry(self):
+        self.assertTrue(
+            should_interrupt_angry(INTERACTIVE_INTERRUPT_ANGER_THRESHOLD + 5))
+
+    def test_custom_threshold_respected(self):
+        self.assertFalse(should_interrupt_angry(1, threshold=2))
+        self.assertTrue(should_interrupt_angry(2, threshold=2))
+
+    def test_none_count_fail_safe_false(self):
+        self.assertFalse(should_interrupt_angry(None))
+
+    def test_negative_count_fail_safe_false(self):
+        self.assertFalse(should_interrupt_angry(-1))
+
+    def test_non_numeric_count_fail_safe_false(self):
+        for bad in ("3", [3], {"n": 3}):
+            self.assertFalse(should_interrupt_angry(bad))
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestExtendMelodyLog(unittest.TestCase):
+    """Merging chunk-detected notes into the running turn melody."""
+
+    def test_merges_new_notes(self):
+        running = [{"pitch": "C5", "duration": 0.3}]
+        result = extend_melody_log(running,
+                                   [{"pitch": "E5", "duration": 0.2}])
+        self.assertEqual(result, [
+            {"pitch": "C5", "duration": 0.3},
+            {"pitch": "E5", "duration": 0.2},
+        ])
+
+    def test_extends_empty_running_log(self):
+        result = extend_melody_log([], INTERACTIVE_LOG_A)
+        self.assertEqual(result, INTERACTIVE_LOG_A)
+
+    def test_empty_new_notes_unchanged(self):
+        running = [{"pitch": "C5", "duration": 0.3}]
+        self.assertEqual(extend_melody_log(running, []), running)
+
+    def test_none_new_notes_unchanged(self):
+        running = [{"pitch": "C5", "duration": 0.3}]
+        self.assertEqual(extend_melody_log(running, None), running)
+
+    def test_malformed_new_notes_rejected(self):
+        # Entries must all be note dicts with pitch and duration keys
+        running = [{"pitch": "C5", "duration": 0.3}]
+        for bad in ("not notes", 42,
+                    [{"pitch": "E5"}],
+                    [{"duration": 0.2}],
+                    [{"pitch": "E5", "duration": 0.2}, "garbage"]):
+            self.assertEqual(extend_melody_log(running, bad), running)
+
+    def test_stores_copy_not_reference(self):
+        # Later mutation of either the running log or the chunk notes
+        # must not corrupt the merged result.
+        running = [{"pitch": "C5", "duration": 0.3}]
+        new_notes = [{"pitch": "E5", "duration": 0.2}]
+        result = extend_melody_log(running, new_notes)
+        running[0]["duration"] = 9.9
+        new_notes[0]["pitch"] = "X9"
+        self.assertEqual(result, [
+            {"pitch": "C5", "duration": 0.3},
+            {"pitch": "E5", "duration": 0.2},
+        ])
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestGenerateInterruptReply(AudioToolsTestCase):
+    """Synthesises the accumulated turn melody as the interactive reply."""
+
+    @staticmethod
+    def _melody_frames(melody):
+        return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+
+    def test_renders_turn_melody_wav(self):
+        out_path = os.path.join(self.tmpdir, "interactive_reply.wav")
+        emotion = generate_interrupt_reply(INTERACTIVE_LOG_A, out_path)
+        self.assertIn(emotion, ("happy", "none"))
+        self.assertIsInstance(emotion, str)
+        self.assertTrue(os.path.exists(out_path))
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(sr, SAMPLE_RATE)
+        self.assertEqual(len(data), self._melody_frames(INTERACTIVE_LOG_A))
+        self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_empty_melody_falls_back_to_confused_noise(self):
+        # Confused-noise fallback: empty accumulated melody renders the
+        # preset confused noise (same as synthesise_output's fallback).
+        out_path = os.path.join(self.tmpdir, "interactive_confused.wav")
+        emotion = generate_interrupt_reply([], out_path)
+        self.assertEqual(emotion, "confused")
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(CONFUSED_MELODY))
+
+    def test_none_melody_falls_back_to_confused_noise(self):
+        out_path = os.path.join(self.tmpdir, "interactive_confused_none.wav")
+        emotion = generate_interrupt_reply(None, out_path)
+        self.assertEqual(emotion, "confused")
+        self.assertTrue(os.path.exists(out_path))
+
+    def test_never_touches_system_reply_wav(self):
+        # system_reply.wav is reserved for the standard recording
+        # pipeline: interactive replies must never write or overwrite
+        # it (they use their own dedicated file instead).
+        reply_path = os.path.join(self.tmpdir, "system_reply.wav")
+        write_wav(reply_path, make_tone(440.0, 0.5))
+        with open(reply_path, "rb") as f:
+            reply_before = f.read()
+        interactive_path = os.path.join(self.tmpdir, "system_interactive.wav")
+        generate_interrupt_reply(INTERACTIVE_LOG_A, interactive_path)
+        self.assertTrue(os.path.exists(reply_path))
+        with open(reply_path, "rb") as f:
+            self.assertEqual(f.read(), reply_before)
+
+    def test_unknown_character_falls_back_to_default(self):
+        out_path = os.path.join(self.tmpdir, "interactive_unknown.wav")
+        emotion = generate_interrupt_reply(INTERACTIVE_LOG_B, out_path,
+                                           character="not_a_character")
+        self.assertIn(emotion, ("happy", "none"))
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(INTERACTIVE_LOG_B))
+
+    def test_every_voice_renders_interrupt_reply(self):
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"interactive_{char}.wav")
+            emotion = generate_interrupt_reply(INTERACTIVE_LOG_B, out_path,
+                                               character=char)
+            self.assertIn(emotion, ("happy", "none"))
+            self.assertTrue(os.path.exists(out_path))
+
+
+@unittest.skipUnless(INTERACTIVE_API_AVAILABLE, INTERACTIVE_API_PENDING)
+class TestGenerateInterruptAngryNoise(AudioToolsTestCase):
+    """Renders the forced angry noise after too many interruptions."""
+
+    @staticmethod
+    def _melody_frames(melody):
+        return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+
+    def test_renders_angry_preset_melody(self):
+        out_path = os.path.join(self.tmpdir, "interrupt_angry.wav")
+        emotion = generate_interrupt_angry_noise("default_cat", out_path)
+        self.assertEqual(emotion, "angry")
+        self.assertTrue(os.path.exists(out_path))
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(sr, SAMPLE_RATE)
+        self.assertEqual(len(data), self._melody_frames(ANGRY_NOISE_MELODY))
+        self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_distinct_from_turn_melody_length(self):
+        # The angry noise must not be confusable with a normal
+        # interactive reply: its frame length differs from the test
+        # melodies' rendered lengths.
+        angry_frames = self._melody_frames(ANGRY_NOISE_MELODY)
+        for log in (INTERACTIVE_LOG_A, INTERACTIVE_LOG_B):
+            self.assertNotEqual(self._melody_frames(log), angry_frames)
+
+    def test_unknown_character_falls_back_to_default(self):
+        out_path = os.path.join(self.tmpdir, "interrupt_angry_unknown.wav")
+        emotion = generate_interrupt_angry_noise("not_a_character", out_path)
+        self.assertEqual(emotion, "angry")
+        self.assertTrue(os.path.exists(out_path))
+
+
+# ---------------------------------------------------------------------
+# Voice-activity detection gate for interactive mode
+# ---------------------------------------------------------------------
+# The VAD gate does not exist before the feature is implemented; the
+# imports are guarded so the baseline suite stays runnable in the red
+# phase and the new tests report as "expected failure: not implemented
+# yet" instead of crashing collection.
+try:
+    from audio_tools import is_chunk_voiced
+    VAD_API_AVAILABLE = True
+except ImportError:
+    VAD_API_AVAILABLE = False
+
+
+VAD_API_PENDING = "voice-activity gate not implemented yet"
+
+
+def make_hum_tone(freq, duration, amp=0.5, sample_rate=SAMPLE_RATE):
+    """Return a harmonic-rich hum/sing tone (speech-like for VAD)."""
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    vibrato = 1.0 + 0.02 * np.sin(2 * np.pi * 6 * t)
+    return amp * (
+        np.sin(2 * np.pi * freq * vibrato * t)
+        + 0.5 * np.sin(2 * np.pi * freq * 2 * vibrato * t)
+        + 0.25 * np.sin(2 * np.pi * freq * 3 * vibrato * t)) / 1.75
+
+
+@unittest.skipUnless(VAD_API_AVAILABLE, VAD_API_PENDING)
+class TestChunkVoiceDetection(AudioToolsTestCase):
+    """The WebRTC VAD gate for streamed interactive chunks."""
+
+    def test_voiced_hum_chunk_is_voiced(self):
+        # A harmonic hum/sing tone chunk must be classified as voiced
+        path = os.path.join(self.tmpdir, "vad_hum.wav")
+        write_wav(path, make_hum_tone(523.25, 0.6))
+        self.assertTrue(is_chunk_voiced(path))
+
+    def test_silent_chunk_not_voiced(self):
+        path = os.path.join(self.tmpdir, "vad_silent.wav")
+        write_wav(path, np.zeros(SAMPLE_RATE // 2))
+        self.assertFalse(is_chunk_voiced(path))
+
+    def test_mostly_silent_chunk_rejected_at_strict_ratio(self):
+        # 80% silence followed by a short tone: a strict custom ratio
+        # must reject the chunk (silence keeps accumulating), while the
+        # default lenient ratio accepts it.
+        samples = np.concatenate([
+            np.zeros(int(SAMPLE_RATE * 0.8)),
+            make_hum_tone(523.25, 0.2),
+        ])
+        lenient_path = os.path.join(self.tmpdir, "vad_mixed_lenient.wav")
+        strict_path = os.path.join(self.tmpdir, "vad_mixed_strict.wav")
+        write_wav(lenient_path, samples)
+        write_wav(strict_path, samples)
+        self.assertTrue(is_chunk_voiced(lenient_path))
+        self.assertFalse(is_chunk_voiced(strict_path, voiced_ratio=0.5))
+
+    def test_corrupt_file_fail_safe_not_voiced(self):
+        # Undecodable input must never crash the streaming loop
+        self.assertFalse(is_chunk_voiced(self.corrupt_wav))
+
+    def test_missing_file_fail_safe_not_voiced(self):
+        self.assertFalse(
+            is_chunk_voiced(os.path.join(self.tmpdir, "nope.wav")))
+
+    def test_header_only_file_fail_safe_not_voiced(self):
+        self.assertFalse(is_chunk_voiced(self.header_only_wav))
+
+
+# ---------------------------------------------------------------------
+# Baseline: existing chunk pipeline functions under streaming use
+# ---------------------------------------------------------------------
+class TestChunkPipelineBaseline(AudioToolsTestCase):
+    """Baseline for the functions the streaming loop will reuse.
+
+    Interactive mode feeds short chunk-sized wav files through
+    normalize_audio() + detect_melody() continuously; these tests pin
+    that the EXISTING functions already handle such short inputs
+    (they must stay green before and after any modification).
+    """
+
+    def test_detect_melody_on_chunk_sized_input(self):
+        # A ~0.6s chunk (typical streaming slice) of a held C5 note
+        chunk_path = os.path.join(self.tmpdir, "chunk_c5.wav")
+        write_wav(chunk_path, make_tone(523.25, 0.6))
+        melody = detect_melody(chunk_path)
+        self.assertGreater(len(melody), 0)
+        for note in melody:
+            self.assertIn("pitch", note)
+            self.assertIn("duration", note)
+            self.assertGreater(note["duration"], 0)
+
+    def test_detect_melody_on_tiny_chunk_returns_empty(self):
+        # Chunks shorter than the stability window yield no notes
+        chunk_path = os.path.join(self.tmpdir, "chunk_tiny.wav")
+        write_wav(chunk_path, make_tone(523.25, 0.05))
+        self.assertEqual(detect_melody(chunk_path), [])
+
+    def test_normalize_and_detect_chunk_integration(self):
+        # The exact streaming sequence: normalise a quiet chunk, then
+        # detect melody from the boosted output.
+        chunk_in = os.path.join(self.tmpdir, "chunk_quiet.wav")
+        chunk_boosted = os.path.join(self.tmpdir, "chunk_quiet_boosted.wav")
+        write_wav(chunk_in, make_tone(523.25, 0.6, amp=0.01))
+        normalize_audio(chunk_in, chunk_boosted)
+        self.assertTrue(os.path.exists(chunk_boosted))
+        melody = detect_melody(chunk_boosted)
+        self.assertGreater(len(melody), 0)
+
+    def test_normalize_chunk_silent_input_writes_nothing(self):
+        chunk_in = os.path.join(self.tmpdir, "chunk_silent.wav")
+        chunk_out = os.path.join(self.tmpdir, "chunk_silent_boosted.wav")
+        write_wav(chunk_in, np.zeros(SAMPLE_RATE // 4))
+        normalize_audio(chunk_in, chunk_out)
+        self.assertFalse(os.path.exists(chunk_out))
+
+    def test_normalize_chunk_undecodable_input_writes_nothing(self):
+        chunk_in = os.path.join(self.tmpdir, "chunk_corrupt.wav")
+        chunk_out = os.path.join(self.tmpdir, "chunk_corrupt_boosted.wav")
+        with open(chunk_in, "wb") as f:
+            f.write(os.urandom(1024))
+        normalize_audio(chunk_in, chunk_out)
+        self.assertFalse(os.path.exists(chunk_out))
+
+
+# ---------------------------------------------------------------------
 # Baseline: existing preset melodies under the sad emotion delivery
 # ---------------------------------------------------------------------
 class TestPresetMelodiesUnderSadEmotion(AudioToolsTestCase):
