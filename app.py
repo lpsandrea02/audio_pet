@@ -1,7 +1,8 @@
 import os
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from audio_tools import (normalize_audio, detect_melody, synthesise_output,
-                         determine_emotion, generate_click_noise)
+                         determine_emotion, generate_click_noise,
+                         add_to_memory, short_term_memory)
 
 app = Flask(__name__)
 
@@ -41,6 +42,11 @@ def analyze_and_generate_reply(input_wav_path, character="default_cat"):
 
     normalize_audio(input_wav_path, "data/recordings/boosted_input.wav")
     note_sequence = detect_melody("data/recordings/boosted_input.wav")
+
+    # Remember this melody for later recall on character clicks.
+    # add_to_memory() silently ignores empty logs, so confused-noise
+    # fallbacks (no detected melody) never pollute the short-term memory.
+    add_to_memory(note_sequence, memory=short_term_memory)
 
     output_audio_filename = "system_reply.wav"
     output_audio_path = os.path.join(RESPONSE_FOLDER, output_audio_filename)
@@ -125,8 +131,12 @@ def character_click():
         - "click_count" (optional): how many times the user has poked
           the character; defaults to 0 if blank or unparseable.
 
-    Synthesises a happy noise (or a forced angry noise once the user
-    clicks too many times) into data/responses/system_noise.wav. This
+    Synthesises the click noise into data/responses/system_noise.wav:
+    occasionally (with MEMORY_SING_PROBABILITY) the Audiopet recalls a
+    randomly chosen melody from its short-term memory and sings it with
+    a happy or neutral delivery; otherwise it emits a happy noise or a
+    neutral click noise (0.70 happy / 0.30 none), with a forced angry
+    noise once the user clicks too many times. This
     file is deliberately separate from system_reply.wav, which stays
     reserved for direct user-to-audiopet interactions.
 
@@ -134,7 +144,8 @@ def character_click():
         Response: JSON payload with keys:
             - "audio_url" (str): URL of the click noise .wav.
             - "skin" (str): The active character name.
-            - "emotion" (str): "happy" or "angry".
+            - "emotion" (str): "happy", "none", or (once over-clicked)
+              "angry".
     """
     character_name = request.form.get("current_skin", "default_cat")
     try:
@@ -148,7 +159,8 @@ def character_click():
     emotion = generate_click_noise(
         character=character_name,
         click_count=click_count,
-        output_filename=noise_audio_path
+        output_filename=noise_audio_path,
+        memory=short_term_memory
     )
 
     return jsonify({

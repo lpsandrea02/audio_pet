@@ -4,7 +4,7 @@ Tests both existing behaviour (baseline), the confused-noise fallback
 behaviour (detect_melody returning [] on invalid input, and
 synthesise_output generating a confused melody when given an empty log),
 and the click-noise API for the clickable character feature (preset
-happy/angry noise melodies, click-count driven emotion draw, and
+happy/none click noise melodies, click-count driven emotion draw, and
 generation into a separate system_noise.wav that never touches
 system_reply.wav).
 
@@ -618,20 +618,25 @@ class TestClickNoiseMelodyPresets(unittest.TestCase):
 
 @unittest.skipUnless(NOISE_API_AVAILABLE, NOISE_API_PENDING)
 class TestDetermineNoiseEmotion(unittest.TestCase):
-    """Click-count driven happy/angry draw for the clickable character."""
+    """Click-count driven happy/none draw for the clickable character."""
 
-    def test_returns_only_happy_or_angry(self):
-        for click_count in range(CLICK_NOISE_ANGER_THRESHOLD + 3):
+    def test_returns_only_happy_or_none(self):
+        for click_count in range(CLICK_NOISE_ANGER_THRESHOLD):
             emotion = determine_noise_emotion(click_count)
-            self.assertIn(emotion, ("happy", "angry"))
+            self.assertIn(emotion, ("happy", "none"))
             self.assertIsInstance(emotion, str)
+
+    def test_overclick_returns_angry(self):
+        for click_count in range(CLICK_NOISE_ANGER_THRESHOLD,
+                                 CLICK_NOISE_ANGER_THRESHOLD + 3):
+            self.assertEqual(determine_noise_emotion(click_count), "angry")
 
     def test_below_threshold_uses_default_probability_structure(self):
         # Same np.random.choice structure as determine_emotion's
         # default draw, restricted to the noise choices: 0.70 happy /
-        # 0.30 angry while the character has not been over-clicked.
+        # 0.30 none while the character has not been over-clicked.
         np.random.seed(7)
-        expected = str(np.random.choice(["happy", "angry"], p=[0.7, 0.3]))
+        expected = str(np.random.choice(["happy", "none"], p=[0.7, 0.3]))
         np.random.seed(7)
         self.assertEqual(determine_noise_emotion(0), expected)
 
@@ -677,7 +682,8 @@ class TestGenerateClickNoise(AudioToolsTestCase):
             emotion = generate_click_noise("default_cat",
                                            click_count, out_path)
             sr, data = wavfile.read(out_path)
-            expected = happy_frames if emotion == "happy" else angry_frames
+            expected = (happy_frames if emotion in ("happy", "none")
+                        else angry_frames)
             self.assertEqual(len(data), expected)
 
     def test_never_touches_system_reply_wav(self):
@@ -724,8 +730,368 @@ class TestGenerateClickNoise(AudioToolsTestCase):
         for char in VOICE_PROFILES:
             out_path = os.path.join(self.tmpdir, f"noise_{char}.wav")
             emotion = generate_click_noise(char, 0, out_path)
-            self.assertIn(emotion, ("happy", "angry"))
+            self.assertIn(emotion, ("happy", "none"))
             self.assertTrue(os.path.exists(out_path))
+
+
+# ---------------------------------------------------------------------
+# Short term memory feature
+# ---------------------------------------------------------------------
+# The short-term memory API does not exist before the feature is
+# implemented; the imports are guarded so the baseline suite stays
+# runnable in the red phase and the new tests report as "expected
+# failure: not implemented yet" instead of crashing collection.
+try:
+    from audio_tools import (
+        MEMORY_SIZE,
+        MEMORY_SING_PROBABILITY,
+        add_to_memory,
+        pick_memory_melody,
+        should_sing_from_memory,
+    )
+    MEMORY_API_AVAILABLE = True
+except ImportError:
+    MEMORY_API_AVAILABLE = False
+
+# generate_click_noise() already exists (click-noise feature) but only
+# gains the memory parameters in a later step; detect that support via
+# inspect so the integration tests skip cleanly until it lands.
+import inspect
+
+from audio_tools import generate_click_noise as _generate_click_noise_probe
+
+GENERATE_MEMORY_SUPPORT = "memory" in inspect.signature(
+    _generate_click_noise_probe).parameters
+
+MEMORY_API_PENDING = "short term memory API not implemented yet"
+GENERATE_MEMORY_PENDING = "generate_click_noise() memory parameters not implemented yet"
+
+# Distinct-length test melodies so rendered wav length reveals which
+# melody was picked (happy/angry presets and memory logs all differ).
+MEMORY_LOG_A = [
+    {"pitch": "C5", "duration": 0.25},
+    {"pitch": "E5", "duration": 0.25},
+]
+MEMORY_LOG_B = [{"pitch": "G5", "duration": 0.4}]
+MEMORY_LOG_C = [
+    {"pitch": "A5", "duration": 0.3},
+    {"pitch": "B5", "duration": 0.3},
+    {"pitch": "C6", "duration": 0.3},
+]
+
+
+@unittest.skipUnless(MEMORY_API_AVAILABLE, MEMORY_API_PENDING)
+class TestMemoryConstants(unittest.TestCase):
+    """The tunable short-term memory constants."""
+
+    def test_memory_size_default_is_five(self):
+        self.assertEqual(MEMORY_SIZE, 5)
+
+    def test_memory_size_is_positive_int(self):
+        self.assertIsInstance(MEMORY_SIZE, int)
+        self.assertGreater(MEMORY_SIZE, 0)
+
+    def test_sing_probability_is_controllable_fraction(self):
+        self.assertIsInstance(MEMORY_SING_PROBABILITY, float)
+        self.assertGreater(MEMORY_SING_PROBABILITY, 0.0)
+        self.assertLess(MEMORY_SING_PROBABILITY, 1.0)
+
+
+@unittest.skipUnless(MEMORY_API_AVAILABLE, MEMORY_API_PENDING)
+class TestAddToMemory(unittest.TestCase):
+    """Storage of successfully detected melodies, capped to the latest n."""
+
+    def test_appends_non_empty_melody(self):
+        memory = []
+        result = add_to_memory(MEMORY_LOG_A, memory=memory)
+        self.assertEqual(len(memory), 1)
+        self.assertEqual(memory[0], MEMORY_LOG_A)
+        self.assertEqual(result, memory)
+
+    def test_empty_melody_ignored(self):
+        # Confused-noise fallback cases (empty log) must never be stored
+        memory = [MEMORY_LOG_A]
+        add_to_memory([], memory=memory)
+        self.assertEqual(len(memory), 1)
+
+    def test_none_melody_ignored(self):
+        memory = []
+        add_to_memory(None, memory=memory)
+        self.assertEqual(memory, [])
+
+    def test_non_list_melody_ignored(self):
+        memory = []
+        for bad in ("not a melody", 42, {"pitch": "C5", "duration": 0.3}):
+            add_to_memory(bad, memory=memory)
+        self.assertEqual(memory, [])
+
+    def test_malformed_notes_ignored(self):
+        # Entries must all be note dicts with pitch and duration keys
+        memory = []
+        for bad in ([1, 2, 3],
+                    [{"pitch": "C5"}],
+                    [{"duration": 0.3}],
+                    [{"pitch": "C5", "duration": 0.3}, "garbage"],
+                    [[]]):
+            add_to_memory(bad, memory=memory)
+        self.assertEqual(memory, [])
+
+    def test_capacity_trims_to_latest_n(self):
+        memory = []
+        for log in (MEMORY_LOG_A, MEMORY_LOG_B, MEMORY_LOG_C):
+            add_to_memory(log, memory=memory)
+        # Default capacity MEMORY_SIZE=5: nothing trimmed yet
+        self.assertEqual(len(memory), 3)
+        extra = [{"pitch": "D6", "duration": 0.2}]
+        for i in range(4):
+            add_to_memory([{"pitch": "D6", "duration": 0.2 + i * 0.01}],
+                          memory=memory)
+        self.assertEqual(len(memory), MEMORY_SIZE)
+        # 7 logs with capacity 5: the two oldest (A, B) are evicted, the
+        # newest entries retained in order
+        self.assertEqual(memory[0], MEMORY_LOG_C)
+        self.assertEqual(memory[-1], [{"pitch": "D6", "duration": 0.23}])
+
+    def test_custom_capacity(self):
+        memory = []
+        add_to_memory(MEMORY_LOG_A, capacity=2, memory=memory)
+        add_to_memory(MEMORY_LOG_B, capacity=2, memory=memory)
+        add_to_memory(MEMORY_LOG_C, capacity=2, memory=memory)
+        self.assertEqual(len(memory), 2)
+        self.assertEqual(memory[0], MEMORY_LOG_B)
+        self.assertEqual(memory[1], MEMORY_LOG_C)
+
+    def test_stores_copy_not_reference(self):
+        # Later mutation of the caller's log must not corrupt memory
+        memory = []
+        log = [{"pitch": "C5", "duration": 0.3}]
+        add_to_memory(log, memory=memory)
+        log.append({"pitch": "E5", "duration": 0.3})
+        self.assertEqual(len(memory[0]), 1)
+
+    def test_module_level_memory_used_by_default(self):
+        from audio_tools import short_term_memory
+        snapshot = list(short_term_memory)
+        try:
+            add_to_memory(MEMORY_LOG_A)
+            self.assertEqual(len(short_term_memory), len(snapshot) + 1)
+            add_to_memory([])
+            add_to_memory(None)
+            self.assertEqual(len(short_term_memory), len(snapshot) + 1)
+        finally:
+            short_term_memory[:] = snapshot
+
+
+@unittest.skipUnless(MEMORY_API_AVAILABLE, MEMORY_API_PENDING)
+class TestPickMemoryMelody(unittest.TestCase):
+    """Random selection of a melody to sing from short-term memory."""
+
+    def test_empty_memory_returns_none(self):
+        self.assertIsNone(pick_memory_melody([]))
+        self.assertIsNone(pick_memory_melody(None))
+
+    def test_returns_member_of_memory(self):
+        memory = [MEMORY_LOG_A, MEMORY_LOG_B, MEMORY_LOG_C]
+        for _ in range(10):
+            self.assertIn(pick_memory_melody(memory), memory)
+
+    def test_seeded_draw_matches_np_random_choice(self):
+        # Regression guard: selection must reuse the plain np.random
+        # draw structure so it stays deterministic under a pinned seed.
+        memory = [MEMORY_LOG_A, MEMORY_LOG_B, MEMORY_LOG_C]
+        np.random.seed(11)
+        result = pick_memory_melody(memory)
+        np.random.seed(11)
+        expected = memory[int(np.random.randint(len(memory)))]
+        self.assertEqual(result, expected)
+
+
+@unittest.skipUnless(MEMORY_API_AVAILABLE, MEMORY_API_PENDING)
+class TestShouldSingFromMemory(unittest.TestCase):
+    """Controllable-probability gate for singing from memory on clicks."""
+
+    def test_empty_memory_never_sings(self):
+        # Even at probability 1.0 there is nothing to sing from
+        for memory in ([], None):
+            np.random.seed(0)
+            self.assertFalse(
+                should_sing_from_memory(memory, sing_probability=1.0))
+
+    def test_probability_one_always_sings_with_memory(self):
+        self.assertTrue(
+            should_sing_from_memory([MEMORY_LOG_A], sing_probability=1.0))
+
+    def test_probability_zero_never_sings_with_memory(self):
+        self.assertFalse(
+            should_sing_from_memory([MEMORY_LOG_A], sing_probability=0.0))
+
+    def test_seeded_draw_matches_np_random_random(self):
+        # The gate must be a plain probability draw (np.random.random()
+        # < p) so it stays deterministic under a pinned seed.
+        np.random.seed(3)
+        expected = np.random.random() < 0.5
+        np.random.seed(3)
+        result = should_sing_from_memory([MEMORY_LOG_A],
+                                         sing_probability=0.5)
+        self.assertEqual(result, expected)
+
+    def test_default_probability_uses_constant(self):
+        np.random.seed(5)
+        expected = np.random.random() < MEMORY_SING_PROBABILITY
+        np.random.seed(5)
+        result = should_sing_from_memory([MEMORY_LOG_A])
+        self.assertEqual(result, expected)
+
+
+@unittest.skipUnless(MEMORY_API_AVAILABLE, MEMORY_API_PENDING)
+@unittest.skipUnless(GENERATE_MEMORY_SUPPORT, GENERATE_MEMORY_PENDING)
+class TestGenerateClickNoiseMemory(AudioToolsTestCase):
+    """generate_click_noise() singing a memory melody as system_noise.wav."""
+
+    @staticmethod
+    def _melody_frames(melody):
+        return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+
+    def test_sings_memory_melody_at_probability_one(self):
+        memory = [MEMORY_LOG_A, MEMORY_LOG_B]
+        out_path = os.path.join(self.tmpdir, "memory_noise.wav")
+        np.random.seed(2)
+        emotion = generate_click_noise("default_cat", 0, out_path,
+                                       memory=memory, sing_probability=1.0)
+        # Mirror the full RNG sequence inside generate_click_noise():
+        # the gate draw fires first, then the melody pick.
+        np.random.seed(2)
+        self.assertTrue(
+            should_sing_from_memory(memory, sing_probability=1.0))
+        expected_melody = pick_memory_melody(memory)
+        self.assertIn(emotion, ("happy", "none"))
+        self.assertIsInstance(emotion, str)
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(sr, SAMPLE_RATE)
+        self.assertEqual(len(data), self._melody_frames(expected_melody))
+        self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_single_melody_memory_always_sings_it(self):
+        memory = [MEMORY_LOG_B]
+        out_path = os.path.join(self.tmpdir, "single_memory.wav")
+        for seed in range(5):
+            np.random.seed(seed)
+            emotion = generate_click_noise(
+                "default_cat", 0, out_path,
+                memory=list(memory), sing_probability=1.0)
+            self.assertIn(emotion, ("happy", "none"))
+            sr, data = wavfile.read(out_path)
+            self.assertEqual(len(data), self._melody_frames(MEMORY_LOG_B))
+
+    def test_empty_memory_falls_back_to_preset_noise(self):
+        # Memory is empty: the click must behave exactly like the
+        # baseline feature (preset happy/angry noise), never a crash.
+        out_path = os.path.join(self.tmpdir, "empty_memory.wav")
+        happy_frames = self._melody_frames(HAPPY_NOISE_MELODY)
+        angry_frames = self._melody_frames(ANGRY_NOISE_MELODY)
+        for click_count in range(0, CLICK_NOISE_ANGER_THRESHOLD + 2):
+            np.random.seed(click_count)
+            emotion = generate_click_noise(
+                "default_cat", click_count, out_path,
+                memory=[], sing_probability=1.0)
+            sr, data = wavfile.read(out_path)
+            expected = (happy_frames if emotion in ("happy", "none")
+                        else angry_frames)
+            self.assertEqual(len(data), expected)
+
+    def test_probability_zero_uses_preset_noise(self):
+        memory = [MEMORY_LOG_A, MEMORY_LOG_C]
+        out_path = os.path.join(self.tmpdir, "prob_zero.wav")
+        happy_frames = self._melody_frames(HAPPY_NOISE_MELODY)
+        angry_frames = self._melody_frames(ANGRY_NOISE_MELODY)
+        for click_count in range(0, CLICK_NOISE_ANGER_THRESHOLD + 2):
+            emotion = generate_click_noise(
+                "default_cat", click_count, out_path,
+                memory=memory, sing_probability=0.0)
+            sr, data = wavfile.read(out_path)
+            expected = (happy_frames if emotion in ("happy", "none")
+                        else angry_frames)
+            self.assertEqual(len(data), expected)
+
+    def test_default_probability_when_sing_probability_omitted(self):
+        # Omitting sing_probability must use MEMORY_SING_PROBABILITY as
+        # the gate: with a pinned seed the result must match a manual
+        # should_sing_from_memory() draw.
+        memory = [MEMORY_LOG_A]
+        out_path = os.path.join(self.tmpdir, "default_prob.wav")
+        np.random.seed(9)
+        expected_sing = should_sing_from_memory(memory)
+        np.random.seed(9)
+        emotion = generate_click_noise("default_cat", 0, out_path,
+                                       memory=memory)
+        sr, data = wavfile.read(out_path)
+        if expected_sing:
+            self.assertEqual(len(data), self._melody_frames(MEMORY_LOG_A))
+            self.assertIn(emotion, ("happy", "none"))
+        else:
+            preset_frames = (self._melody_frames(HAPPY_NOISE_MELODY)
+                             if emotion in ("happy", "none")
+                             else self._melody_frames(ANGRY_NOISE_MELODY))
+            self.assertEqual(len(data), preset_frames)
+
+    def test_overclick_never_sings_from_memory(self):
+        # Once the click threshold is reached the pet is fed up: the
+        # memory is never used, only the preset angry noise plays,
+        # until the click count resets (e.g. after a new recording).
+        # The angry preset has a distinct frame length from every
+        # memory melody, so the rendered length proves which was used.
+        memory = [MEMORY_LOG_A, MEMORY_LOG_B]
+        out_path = os.path.join(self.tmpdir, "memory_overclick.wav")
+        angry_frames = self._melody_frames(ANGRY_NOISE_MELODY)
+        self.assertNotIn(angry_frames,
+                         [self._melody_frames(m) for m in memory])
+        for click_count in range(CLICK_NOISE_ANGER_THRESHOLD,
+                                 CLICK_NOISE_ANGER_THRESHOLD + 3):
+            for seed in range(3):
+                np.random.seed(seed)
+                emotion = generate_click_noise(
+                    "default_cat", click_count, out_path,
+                    memory=list(memory), sing_probability=1.0)
+                self.assertEqual(emotion, "angry")
+                sr, data = wavfile.read(out_path)
+                self.assertEqual(len(data), angry_frames)
+
+    def test_memory_sing_never_touches_system_reply_wav(self):
+        # system_reply.wav stays reserved for direct user-to-audiopet
+        # interactions, exactly as for the baseline click noise.
+        reply_path = os.path.join(self.tmpdir, "system_reply.wav")
+        write_wav(reply_path, make_tone(440.0, 0.5))
+        with open(reply_path, "rb") as f:
+            reply_before = f.read()
+        noise_path = os.path.join(self.tmpdir, "memory_reply_guard.wav")
+        generate_click_noise("default_cat", 0, noise_path,
+                             memory=[MEMORY_LOG_A], sing_probability=1.0)
+        self.assertTrue(os.path.exists(reply_path))
+        with open(reply_path, "rb") as f:
+            self.assertEqual(f.read(), reply_before)
+
+    def test_memory_sing_does_not_create_system_reply_wav(self):
+        reply_path = os.path.join(self.tmpdir, "system_reply.wav")
+        if os.path.exists(reply_path):
+            os.remove(reply_path)
+        noise_path = os.path.join(self.tmpdir, "memory_noise_only.wav")
+        generate_click_noise("default_cat", 0, noise_path,
+                             memory=[MEMORY_LOG_A], sing_probability=1.0)
+        self.assertFalse(os.path.exists(reply_path))
+
+    def test_memory_mutation_after_click_does_not_corrupt_render(self):
+        # The stored copy must stay independent of the caller's list,
+        # so rendering cannot be affected by later edits to the log.
+        log = [{"pitch": "C5", "duration": 0.3}]
+        memory = []
+        add_to_memory(log, memory=memory)
+        log[0]["duration"] = 9.9
+        out_path = os.path.join(self.tmpdir, "copy_guard.wav")
+        generate_click_noise("default_cat", 0, out_path,
+                             memory=memory, sing_probability=1.0)
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames([{"pitch": "C5",
+                                                          "duration": 0.3}]))
 
 
 if __name__ == "__main__":

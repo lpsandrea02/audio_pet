@@ -21,6 +21,12 @@ Constants:
         web app (rendered into system_noise.wav, never system_reply.wav).
     CLICK_NOISE_ANGER_THRESHOLD (int): Click count at which the
         click-noise draw is replaced by a forced angry noise.
+    MEMORY_SIZE (int): Capacity of the rolling short-term memory: the
+        number of latest successfully detected melody logs kept for
+        later recall.
+    MEMORY_SING_PROBABILITY (float): Probability that a click on the
+        character makes the Audiopet sing a randomly chosen melody from
+        short-term memory instead of its preset click noise.
 """
 
 import aubio
@@ -84,6 +90,141 @@ ANGRY_NOISE_MELODY = [
 # Number of character clicks after which the random draw is abandoned
 # and an angry click noise is forced instead.
 CLICK_NOISE_ANGER_THRESHOLD = 5
+
+# =====================================================================
+# SHORT TERM MEMORY
+# =====================================================================
+
+# Capacity of the rolling short-term memory (the latest n successfully
+# detected melody logs are kept; customisable) and the probability that
+# a click on the character triggers a memory recall instead of the
+# preset click noise (controllable).
+MEMORY_SIZE = 5
+MEMORY_SING_PROBABILITY = 0.15
+
+# Rolling short-term memory of the latest successfully detected melody
+# logs. Confused-noise fallback cases (empty melody logs) are never
+# stored; see :func:`add_to_memory`.
+short_term_memory = []
+
+
+def _is_valid_melody_log(melody_log):
+    """
+    Checks whether a melody log is storable in short-term memory.
+
+    A valid log is a non-empty list (or tuple) of note dicts that each
+    carry at least a "pitch" and a "duration" key — the exact shape
+    produced by :func:`detect_melody`. Anything else (including the
+    empty logs behind the confused-noise fallback, None, or malformed
+    entries) is rejected.
+
+    Args:
+        melody_log (list[dict] or tuple or any): Candidate melody log.
+
+    Returns:
+        bool: True if the log can be stored in short-term memory.
+    """
+    if not isinstance(melody_log, (list, tuple)) or not melody_log:
+        return False
+    for step in melody_log:
+        if (not isinstance(step, dict)
+                or "pitch" not in step
+                or "duration" not in step):
+            return False
+    return True
+
+
+def add_to_memory(melody_log, capacity=MEMORY_SIZE, memory=None):
+    """
+    Stores a successfully detected melody log in the short-term memory.
+
+    Only valid melody logs are stored (see
+    :func:`_is_valid_melody_log`); in particular, empty logs — the
+    confused-noise fallback cases — are silently ignored. The log is
+    stored as a nested copy so later mutation of the caller's list or
+    note dicts cannot corrupt the memory. When the memory exceeds
+    ``capacity``, the oldest entries are evicted so only the latest
+    ``capacity`` logs remain.
+
+    Args:
+        melody_log (list[dict]): Detected melody, one dict per note:
+            {"pitch": str, "duration": float}. Invalid or empty logs
+            are ignored.
+        capacity (int, optional): Maximum number of logs to keep.
+            Defaults to ``MEMORY_SIZE`` (5). A capacity of 0 keeps
+            nothing; negative capacities keep everything.
+        memory (list, optional): The rolling memory list to append to.
+            Defaults to the module-level ``short_term_memory``.
+
+    Returns:
+        list: The updated memory list (the same object passed in).
+    """
+    if memory is None:
+        memory = short_term_memory
+
+    if not _is_valid_melody_log(melody_log):
+        return memory
+
+    # Deep-enough copy: fresh per-note dicts so the caller cannot
+    # mutate memory contents after the fact (e.g. reuse of the log in
+    # later pipeline stages).
+    memory.append([{**step} for step in melody_log])
+
+    if capacity >= 0 and len(memory) > capacity:
+        del memory[:len(memory) - capacity]
+
+    return memory
+
+
+def pick_memory_melody(memory):
+    """
+    Picks a random melody log from the short-term memory for recall.
+
+    Uses the same seeded-deterministic ``np.random`` draw structure as
+    the rest of the behaviour logic.
+
+    Args:
+        memory (list): List of stored melody logs (as produced by
+            :func:`add_to_memory`).
+
+    Returns:
+        list[dict]: One randomly chosen melody log, or None if the
+        memory is empty or None (in which case the caller must fall
+        back to the default click-noise behaviour).
+    """
+    if not memory:
+        return None
+
+    index = int(np.random.randint(len(memory)))
+    return memory[index]
+
+
+def should_sing_from_memory(memory, sing_probability=None):
+    """
+    Decides whether a click should trigger a memory recall instead of
+    the preset click noise.
+
+    An empty (or None) memory never sings, even at probability 1.0 —
+    there is nothing to recall. Otherwise a plain ``np.random.random()``
+    probability draw decides, keeping the behaviour deterministic under
+    a pinned seed.
+
+    Args:
+        memory (list): List of stored melody logs.
+        sing_probability (float, optional): Probability of singing a
+            memory melody on a click. Defaults to
+            ``MEMORY_SING_PROBABILITY``.
+
+    Returns:
+        bool: True if the click should sing a melody from memory.
+    """
+    if sing_probability is None:
+        sing_probability = MEMORY_SING_PROBABILITY
+
+    if not memory:
+        return False
+
+    return bool(np.random.random() < sing_probability)
 
 # =====================================================================
 # 1. INPUT MELODY DETECTION 
@@ -602,7 +743,7 @@ def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
     actual_duration = _get_raw_audio_duration(input_path)
 
     # CRITERION 1: If the response is significantly shorter than the input clip, default to confused
-    if actual_duration > 0.0 and predicted_duration < (actual_duration * 0.75):
+    if actual_duration > 0.0 and predicted_duration < (actual_duration * 0.4):
         print(f"🧐 Timeline mismatch! (Melody: {predicted_duration:.2f}s vs Raw: {actual_duration:.2f}s) -> Overriding to Confused.")
         return "confused"
 
@@ -629,22 +770,22 @@ def determine_noise_emotion(click_count):
     Uses the same weighted ``np.random.choice`` probability structure as
     the standard responses in :func:`determine_emotion`, restricted to
     the noise choices: while the pet has not been over-clicked the draw
-    is 0.70 happy / 0.30 angry. Once ``click_count`` reaches
-    ``CLICK_NOISE_ANGER_THRESHOLD`` the random draw is abandoned and an
-    angry noise is forced.
+    is 0.70 happy / 0.30 none (a neutral click delivery). Once
+    ``click_count`` reaches ``CLICK_NOISE_ANGER_THRESHOLD`` the random
+    draw is abandoned and an angry noise is forced.
 
     Parameters:
     - click_count (int): How many times the user has poked the
       character (the frontend counts consecutive clicks).
 
     Returns:
-        str: "happy" or "angry".
+        str: "happy", "none", or (once over-clicked) "angry".
     """
     if click_count >= CLICK_NOISE_ANGER_THRESHOLD:
         print(f"😠 Clicked {click_count} times! The Audiopet is fed up.")
         return "angry"
 
-    choices =       ["happy", "angry"]
+    choices =       ["happy", "none"]
     probabilities = [0.70,     0.30]
 
     # Same random probability structure as determine_emotion(): a plain
@@ -653,15 +794,26 @@ def determine_noise_emotion(click_count):
 
 
 def generate_click_noise(character="default_cat", click_count=0,
-                         output_filename="system_noise.wav"):
+                         output_filename="system_noise.wav",
+                         memory=None, sing_probability=None):
     """
     Synthesises the click noise for a poke on the character and writes
     it to a dedicated noise file.
 
-    Decides the noise emotion via :func:`determine_noise_emotion` (happy
-    draw, forced angry once over-clicked), selects the matching preset
-    melody (``HAPPY_NOISE_MELODY`` / ``ANGRY_NOISE_MELODY``), and renders
-    it in the character's voice. Unlike the standard response pipeline,
+    Occasionally (with a controllable probability) the Audiopet recalls
+    a randomly chosen melody from its short-term memory and sings that
+    back instead, with a happy or neutral delivery. Memory recall only
+    happens while the pet is NOT over-clicked: once ``click_count``
+    reaches ``CLICK_NOISE_ANGER_THRESHOLD`` only the preset angry noise
+    plays (never a memory melody) until the click count resets (e.g.
+    after a new user recording). If the memory is empty (or the
+    probability draw fails) the behaviour falls back to the default
+    click noise: the emotion is decided via
+    :func:`determine_noise_emotion` (0.70 happy / 0.30 none, forced
+    angry once over-clicked) and the preset melody is rendered — the
+    angry noise (``ANGRY_NOISE_MELODY``) once over-clicked, otherwise
+    the happy noise (``HAPPY_NOISE_MELODY``) in the drawn delivery.
+    Unlike the standard response pipeline,
     the result must never be written to ``system_reply.wav``: that file
     is reserved for direct user-to-audiopet interactions, so callers
     pass a separate path (e.g. ``data/responses/system_noise.wav``).
@@ -673,14 +825,28 @@ def generate_click_noise(character="default_cat", click_count=0,
       the character. Defaults to 0.
     - output_filename (str, optional): Path of the .wav file to write.
       Defaults to "system_noise.wav".
+    - memory (list, optional): The short-term memory (list of stored
+      melody logs, as produced by :func:`add_to_memory`). An empty or
+      None memory disables memory recall entirely. Defaults to None.
+    - sing_probability (float, optional): Probability of singing a
+      memory melody on this click. Defaults to
+      ``MEMORY_SING_PROBABILITY``.
 
     Returns:
-        str: The noise emotion actually synthesised ("happy" or
-        "angry"), for the frontend animation.
+        str: The noise emotion actually synthesised ("happy", "none",
+        or "angry"), for the frontend animation.
     """
-    emotion = determine_noise_emotion(click_count)
-    melody_log = (HAPPY_NOISE_MELODY if emotion == "happy"
-                  else ANGRY_NOISE_MELODY)
+    over_clicked = click_count >= CLICK_NOISE_ANGER_THRESHOLD
+    if (not over_clicked
+            and should_sing_from_memory(memory,
+                                        sing_probability=sing_probability)):
+        # Memory recall: sing a randomly chosen previously heard melody
+        melody_log = pick_memory_melody(memory)
+        emotion = determine_noise_emotion(click_count)
+    else:
+        emotion = determine_noise_emotion(click_count)
+        melody_log = (ANGRY_NOISE_MELODY if over_clicked
+                      else HAPPY_NOISE_MELODY)
 
     synthesise_output(melody_log,
                       output_filename=output_filename,
