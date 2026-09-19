@@ -241,8 +241,8 @@ def should_sing_from_memory(memory, sing_probability=None):
 # Random spacing between consecutive idle character noises: every idle
 # delay is drawn uniformly from [IDLE_NOISE_MIN_DELAY,
 # IDLE_NOISE_MAX_DELAY] seconds (controllable).
-IDLE_NOISE_MIN_DELAY = 8.0
-IDLE_NOISE_MAX_DELAY = 20.0
+IDLE_NOISE_MIN_DELAY = 30.0
+IDLE_NOISE_MAX_DELAY = 300.0
 
 # Fixed number of idle noises the character may emit per idle session;
 # after this many noises a final sad noise plays once and the character
