@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Character Audio Companion</title>
+    <title>Audiopet: Character Audio Companion</title>
     <style>
         /* Theme variables: light (default) */
         body {
@@ -38,7 +38,10 @@
         body {
             background-color: var(--bg);
             color: var(--text);
-            font-family: sans-serif, Consolas, Menlo, Monaco, "Courier New", monospace;
+            /* UI font is switchable from the settings menu; the ASCII
+               character display keeps its own fixed font (see
+               .ascii-display) so the art alignment never changes. */
+            font-family: var(--ui-font, sans-serif, Consolas, Menlo, Monaco, "Courier New", monospace);
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -83,6 +86,10 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            /* Fixed font: selection-screen ASCII art must never be
+               reflowed or re-styled by the settings font (it breaks
+               the art alignment, e.g. in Times New Roman) */
+            font-family: sans-serif, Consolas, Menlo, Monaco, "Courier New", monospace;
         }
         /* Main Interaction Screen (Hidden initially) */
         .character-box {
@@ -98,7 +105,7 @@
         .ascii-display {
             white-space: pre;
             font-size: 24px;
-            line-height: 1.4;
+            line-height: 1.2;
             margin-bottom: 25px;
             min-height: 120px;
             display: flex;
@@ -106,6 +113,9 @@
             justify-content: center;
             cursor: pointer;
             user-select: none;
+            /* Fixed font: the ASCII art must never reflow when the UI
+               font is changed in the settings menu */
+            font-family: sans-serif, Consolas, Menlo, Monaco, "Courier New", monospace;
         }
         .controls {
             display: flex;
@@ -120,6 +130,9 @@
             border-radius: 6px;
             cursor: pointer;
             font-weight: bold;
+            /* Form controls do not inherit the body font by default;
+               force inheritance so the settings font applies here too */
+            font-family: inherit;
         }
         button:hover { background-color: var(--btn-hover); }
         button.recording { background-color: #cc241d; color: #fff; }
@@ -178,8 +191,8 @@
 
     <!-- SCREEN 1: SELECT CHARACTER -->
     <div id="selection-screen" class="selection-screen">
-        <h2>Select Your Companion</h2>
-        <p style="color: var(--muted-text);">Choose one of your 5 custom skins to get started:</p>
+        <h2>Select Your Audiopet</h2>
+        <p style="color: var(--muted-text);">Choose one of 5 characters to get started:</p>
         <div class="skin-grid" id="skin-grid"></div>
     </div>
 
@@ -208,6 +221,13 @@
             </label>
             <label class="setting-row">Dark mode
                 <input type="checkbox" id="dark-mode-toggle">
+            </label>
+            <label class="setting-row">Font
+                <select id="font-select">
+                    <option value="default">Sans Serif</option>
+                    <option value="'Comic Sans MS', 'Comic Sans', cursive" selected>Comic Sans MS</option>
+                    <option value="'Courier New', Courier, monospace">Courier New</option>
+                </select>
             </label>
         </div>
     </div>
@@ -628,6 +648,7 @@ const swapCharacterBtn = document.getElementById("swap-character-btn");
 const volumeSlider = document.getElementById("volume-slider");
 const idleNoiseToggle = document.getElementById("idle-noise-toggle");
 const darkModeToggle = document.getElementById("dark-mode-toggle");
+const fontSelect = document.getElementById("font-select");
 
 settingsBtn.addEventListener("click", () => {
     settingsOverlay.style.display = "flex";
@@ -664,6 +685,19 @@ idleNoiseToggle.addEventListener("change", () => {
 darkModeToggle.addEventListener("change", () => {
     document.body.classList.toggle("dark-mode", darkModeToggle.checked);
 });
+
+fontSelect.addEventListener("change", () => {
+    if (fontSelect.value === "default") {
+        document.body.style.removeProperty("--ui-font");
+    } else {
+        document.body.style.setProperty("--ui-font", fontSelect.value);
+    }
+});
+
+// Apply the initially selected font (Comic Sans MS) on page load
+if (fontSelect.value !== "default") {
+    document.body.style.setProperty("--ui-font", fontSelect.value);
+}
 
 </script>
 </body>
