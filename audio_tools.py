@@ -27,6 +27,13 @@ Constants:
     MEMORY_SING_PROBABILITY (float): Probability that a click on the
         character makes the Audiopet sing a randomly chosen melody from
         short-term memory instead of its preset click noise.
+    IDLE_NOISE_MIN_DELAY / IDLE_NOISE_MAX_DELAY (float): Bounds (in
+        seconds) of the random spacing between consecutive idle
+        character noises.
+    IDLE_NOISE_MAX_COUNT (int): Fixed number of idle noises after which
+        the character emits a final sad noise and then stays silent.
+    SAD_NOISE_MELODY (list): Preset note sequence of the final sad
+        noise (delivered with the "sad" emotion).
 """
 
 import aubio
@@ -225,6 +232,195 @@ def should_sing_from_memory(memory, sing_probability=None):
         return False
 
     return bool(np.random.random() < sing_probability)
+
+
+# =====================================================================
+# IDLE CHARACTER NOISES
+# =====================================================================
+
+# Random spacing between consecutive idle character noises: every idle
+# delay is drawn uniformly from [IDLE_NOISE_MIN_DELAY,
+# IDLE_NOISE_MAX_DELAY] seconds (controllable).
+IDLE_NOISE_MIN_DELAY = 8.0
+IDLE_NOISE_MAX_DELAY = 20.0
+
+# Fixed number of idle noises the character may emit per idle session;
+# after this many noises a final sad noise plays once and the character
+# stays silent until the user interacts again (controllable).
+IDLE_NOISE_MAX_COUNT = 3
+
+# Probability that an idle noise recalls a randomly chosen melody from
+# short-term memory instead of drawing one of the preset idle noises
+# (controllable; skipped entirely when the memory is empty).
+IDLE_MEMORY_PROBABILITY = 0.25
+
+# Preset melody synthesised as the final sad idle noise, delivered with
+# the "sad" emotion once IDLE_NOISE_MAX_COUNT idle noises have played.
+SAD_NOISE_MELODY = [
+    {'pitch': 'B5',  'duration': 0.25},
+    {'pitch': 'A#5', 'duration': 0.25},
+    {'pitch': 'A5',  'duration': 0.25},
+    {'pitch': 'G#5', 'duration': 0.25},
+    {'pitch': 'G5',  'duration': 0.25},
+]
+
+
+def get_idle_noise_delay(min_delay=None, max_delay=None):
+    """
+    Draws the random waiting time before the next idle character noise.
+
+    Each idle noise is randomly spaced: the delay is drawn uniformly
+    between the minimum and maximum idle-noise delays, so consecutive
+    idle noises never arrive at a fixed interval. The bounds are
+    controllable per call.
+
+    Args:
+        min_delay (float, optional): Lower bound of the delay in
+            seconds. Defaults to ``IDLE_NOISE_MIN_DELAY``.
+        max_delay (float, optional): Upper bound of the delay in
+            seconds. Defaults to ``IDLE_NOISE_MAX_DELAY``.
+
+    Returns:
+        float: Delay in seconds. Fail-safe: an inverted (min > max)
+        range is swapped rather than raising, and an equal-width range
+        returns that exact value, so callers can never crash.
+    """
+    if min_delay is None:
+        min_delay = IDLE_NOISE_MIN_DELAY
+    if max_delay is None:
+        max_delay = IDLE_NOISE_MAX_DELAY
+
+    min_delay = float(min_delay)
+    max_delay = float(max_delay)
+
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+
+    if min_delay == max_delay:
+        return min_delay
+
+    return float(np.random.uniform(min_delay, max_delay))
+
+
+def pick_idle_noise(memory=None, memory_probability=None):
+    """
+    Picks the melody and emotion for one idle character noise.
+
+    The noise is drawn from the idle-noise option pool: the preset
+    happy melody (``HAPPY_NOISE_MELODY``), the preset confused melody
+    (``CONFUSED_MELODY``), the preset angry melody
+    (``ANGRY_NOISE_MELODY``), or — with ``memory_probability`` and only
+    while the short-term memory is non-empty — a randomly chosen
+    previously heard melody (via :func:`pick_memory_melody`) sung with
+    a happy or neutral delivery (same weighted ``np.random.choice``
+    structure as the click noise). Uses the same seeded-deterministic
+    ``np.random`` draw structure as the rest of the behaviour logic.
+
+    Args:
+        memory (list, optional): The short-term memory (list of stored
+            melody logs, as produced by :func:`add_to_memory`). An
+            empty or None memory disables memory recall entirely.
+            Defaults to None.
+        memory_probability (float, optional): Probability that the idle
+            noise is a memory recall instead of a preset noise.
+            Defaults to ``IDLE_MEMORY_PROBABILITY``.
+
+    Returns:
+        tuple: ``(melody_log, emotion)`` where ``melody_log`` is one of
+        the preset melodies or a memory log, and ``emotion`` is the
+        delivery ("happy", "none", "confused", or "angry").
+    """
+    if memory_probability is None:
+        memory_probability = IDLE_MEMORY_PROBABILITY
+
+    if memory and np.random.random() < memory_probability:
+        melody_log = pick_memory_melody(memory)
+        emotion = str(np.random.choice(["happy", "none"], p=[0.70, 0.30]))
+        return melody_log, emotion
+
+    preset_options = [
+        (HAPPY_NOISE_MELODY, "happy"),
+        (CONFUSED_MELODY, "confused"),
+        (ANGRY_NOISE_MELODY, "angry"),
+    ]
+    return preset_options[int(np.random.randint(len(preset_options)))]
+
+
+def should_emit_idle_noise(idle_count):
+    """
+    Decides whether another idle character noise may still be emitted.
+
+    Idle noises are emitted until ``idle_count`` reaches
+    ``IDLE_NOISE_MAX_COUNT``; at that point the final sad noise plays
+    instead and no further idle noises are generated (the caller must
+    stop scheduling until the user interacts again).
+
+    Args:
+        idle_count (int): How many idle noises have already been
+            emitted in the current idle session.
+
+    Returns:
+        bool: True if another regular idle noise is allowed.
+    """
+    return idle_count < IDLE_NOISE_MAX_COUNT
+
+
+def generate_idle_noise(character="default_cat", idle_count=0,
+                        output_filename="system_idle.wav",
+                        memory=None, memory_probability=None):
+    """
+    Synthesises one idle character noise and writes it to a dedicated
+    noise file.
+
+    While ``should_emit_idle_noise(idle_count)`` allows it, a melody
+    and emotion are drawn via :func:`pick_idle_noise` (preset
+    happy/confused/angry noise or a short-term memory recall) and
+    rendered in the character's voice. Once ``idle_count`` reaches
+    ``IDLE_NOISE_MAX_COUNT`` the preset sad noise
+    (``SAD_NOISE_MELODY``) is rendered with the "sad" emotion instead,
+    flagged as final: the caller must not schedule any further idle
+    noises after it. The result is written to a dedicated idle file
+    (e.g. ``data/responses/system_idle.wav``) so it never touches
+    ``system_reply.wav`` (reserved for direct user-to-audiopet
+    interactions) or ``system_noise.wav`` (reserved for pokes).
+
+    Parameters:
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+    - idle_count (int, optional): How many idle noises have already
+      been emitted in the current idle session. Defaults to 0.
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "system_idle.wav".
+    - memory (list, optional): The short-term memory (list of stored
+      melody logs, as produced by :func:`add_to_memory`). An empty or
+      None memory disables memory recall entirely. Defaults to None.
+    - memory_probability (float, optional): Probability that the idle
+      noise is a memory recall. Defaults to
+      ``IDLE_MEMORY_PROBABILITY``.
+
+    Returns:
+        tuple: ``(emotion, is_final)`` where ``emotion`` is the noise
+        emotion actually synthesised ("happy", "none", "confused",
+        "angry", or "sad") for the frontend animation, and ``is_final``
+        is True only when the final sad noise was rendered (no further
+        idle noises may follow).
+    """
+    if not should_emit_idle_noise(idle_count):
+        emotion = synthesise_output(SAD_NOISE_MELODY,
+                                    output_filename=output_filename,
+                                    sample_rate=44100,
+                                    character=character,
+                                    emotion="sad")
+        return emotion, True
+
+    melody_log, emotion = pick_idle_noise(memory=memory,
+                                          memory_probability=memory_probability)
+    synthesise_output(melody_log,
+                      output_filename=output_filename,
+                      sample_rate=44100,
+                      character=character,
+                      emotion=emotion)
+    return emotion, False
 
 # =====================================================================
 # 1. INPUT MELODY DETECTION 

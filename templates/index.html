@@ -104,6 +104,45 @@
             font-size: 11px;
             padding: 6px 12px;
         }
+        /* Settings menu overlay */
+        .settings-overlay {
+            display: none; /* Controlled via JS */
+            position: fixed;
+            inset: 0;
+            background-color: rgba(40, 37, 37, 0.45);
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .settings-menu {
+            position: relative;
+            background-color: #f4e8d0;
+            border: 3px solid #eccb93;
+            border-radius: 12px;
+            padding: 30px 40px;
+            text-align: center;
+            min-width: 240px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.35);
+        }
+        .settings-menu h3 { margin-top: 0; }
+        .settings-close {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            padding: 4px 10px;
+            font-size: 12px;
+            background-color: #cc241d;
+            color: #fff;
+        }
+        .settings-action { display: block; width: 100%; margin-bottom: 18px; }
+        .setting-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 12px;
+            font-size: 13px;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -123,7 +162,22 @@
             <button id="play-btn" disabled>Play Last Reply</button>
         </div>
         <div id="status" class="status-text">Status: Idle</div>
-        <button id="change-char-btn" class="back-btn">swap character</button>
+        <button id="settings-btn" class="back-btn">⚙ Settings</button>
+    </div>
+
+    <!-- SETTINGS MENU OVERLAY -->
+    <div id="settings-overlay" class="settings-overlay">
+        <div class="settings-menu">
+            <button id="settings-close-btn" class="settings-close">X</button>
+            <h3>Settings</h3>
+            <button id="swap-character-btn" class="settings-action">Swap Character</button>
+            <label class="setting-row">Volume
+                <input type="range" id="volume-slider" min="0" max="100" value="100">
+            </label>
+            <label class="setting-row">Idle character noises
+                <input type="checkbox" id="idle-noise-toggle" checked>
+            </label>
+        </div>
     </div>
 
 <script>
@@ -198,6 +252,16 @@ let lastResponseAudioUrl = "";
 let clickCount = 0;
 let noiseAudio = null;
 
+// Idle character noises: the character emits idle noises after a
+// randomly spaced silence threshold (drawn by the backend), up to a
+// fixed number of noises, after which a final sad noise plays once
+// and the character stays silent until the next interaction.
+let idleCount = 0;
+let idleTimer = null;
+let idleEnabled = true;     // toggled from the settings menu
+let idleSilenced = false;   // True once the final sad noise has played
+let masterVolume = 1.0;     // controlled from the settings menu
+
 // Element Selectors
 const selectionScreen = document.getElementById("selection-screen");
 const mainScreen = document.getElementById("main-screen");
@@ -206,7 +270,6 @@ const asciiDisplay = document.getElementById("ascii-art");
 const recordBtn = document.getElementById("record-btn");
 const playBtn = document.getElementById("play-btn");
 const statusText = document.getElementById("status");
-const changeCharBtn = document.getElementById("change-char-btn");
 
 // =====================================================================
 // 2. GENERATE THE SELECTION GRID DYNAMICALLY
@@ -235,13 +298,11 @@ function selectCharacter(skinKey) {
     selectionScreen.style.display = "none";
     mainScreen.style.display = "block";
     renderFrame();
+    resetIdleCycle();
 }
 
-// Return back to selection screen action
-changeCharBtn.addEventListener("click", () => {
-    mainScreen.style.display = "none";
-    selectionScreen.style.display = "block";
-});
+// Return back to selection screen action is handled by the Settings
+// menu's "Swap Character" button (section 7).
 
 // =====================================================================
 // 3. STOP-MOTION ANIMATION TICK LOOP
@@ -269,6 +330,7 @@ buildSelectionMenu();
 // 4. MICROPHONE DATA STREAM PIPELINE
 // =====================================================================
 recordBtn.addEventListener("click", async () => {
+    resetIdleCycle();
     if (mediaRecorder && mediaRecorder.state === "recording") {
         mediaRecorder.stop();
         recordBtn.textContent = "Record Input";
@@ -344,22 +406,16 @@ async function sendToFlaskBackend(blob) {
 
 playBtn.addEventListener("click", () => {
     if (!lastResponseAudioUrl) return;
-    const audio = new Audio(lastResponseAudioUrl);
-    isSpeaking = true;
-    statusText.textContent = "Status: Character speaking...";
-
-    audio.onended = () => {
-        isSpeaking = false;
-        statusText.textContent = "Status: Idle";
-    };
-    audio.play();
+    triggerAudioPlayback();
 });
 
 // Universal playback engine function shared by both autoplay and the replay button
 function triggerAudioPlayback() {
     if (!lastResponseAudioUrl) return;
+    resetIdleCycle();
     
     const audio = new Audio(lastResponseAudioUrl);
+    audio.volume = masterVolume;
     isSpeaking = true;
     statusText.textContent = "Status: Character speaking...";
     
@@ -391,6 +447,7 @@ playBtn.addEventListener("click", () => {
 // so the "Play Last Reply" button cannot replay it.
 asciiDisplay.addEventListener("click", async () => {
     clickCount += 1;
+    resetIdleCycle();
     statusText.textContent = "Status: Poked!";
 
     const formData = new FormData();
@@ -412,13 +469,14 @@ asciiDisplay.addEventListener("click", async () => {
     }
 });
 
-function playClickNoise(url, emotion) {
+function playClickNoise(url, emotion, keepEmotion = false) {
     // Cut off any previously playing noise so rapid pokes don't stack
     if (noiseAudio) {
         noiseAudio.pause();
     }
 
     noiseAudio = new Audio(url);
+    noiseAudio.volume = masterVolume;
     const prevEmotion = currentEmotion;
     currentEmotion = emotion || prevEmotion;
     isSpeaking = true;
@@ -427,7 +485,11 @@ function playClickNoise(url, emotion) {
 
     noiseAudio.onended = () => {
         isSpeaking = false;
-        currentEmotion = prevEmotion;
+        // The final sad idle noise lingers: the character stays in sad
+        // mode visually until a new user recording resets the emotion.
+        if (!keepEmotion) {
+            currentEmotion = prevEmotion;
+        }
         statusText.textContent = "Status: Idle";
     };
 
@@ -436,11 +498,135 @@ function playClickNoise(url, emotion) {
     noiseAudio.play().catch(err => {
         console.warn("Noise playback blocked by browser policy.", err);
         isSpeaking = false;
-        currentEmotion = prevEmotion;
+        if (!keepEmotion) {
+            currentEmotion = prevEmotion;
+        }
         statusText.textContent = "Status: Autoplay blocked.";
     });
 }
 
+// =====================================================================
+// 6. IDLE CHARACTER NOISES (randomly spaced idle melodic noises)
+// =====================================================================
+// Idle noises are requested from the backend after a random delay so
+// spacing between consecutive noises is never fixed. Any user
+// interaction resets the idle cycle. After IDLE_NOISE_MAX_COUNT noises
+// the backend delivers the sad noise once (is_final) and the timer is
+// permanently stopped until the next interaction.
+
+function stopIdleTimer() {
+    if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+    }
+}
+
+// Called on every user interaction: restarts the full idle cycle.
+function resetIdleCycle() {
+    idleCount = 0;
+    idleSilenced = false;
+    scheduleNextIdleNoise();
+}
+
+async function scheduleNextIdleNoise() {
+    stopIdleTimer();
+    if (!idleEnabled || idleSilenced) return;
+    let delaySeconds;
+    try {
+        const response = await fetch("/api/idle-delay");
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+        delaySeconds = data.delay;
+    } catch (err) {
+        // Fail-safe local draw if the delay endpoint is unreachable
+        delaySeconds = 8 + Math.random() * 12;
+    }
+    idleTimer = setTimeout(triggerIdleNoise, delaySeconds * 1000);
+}
+
+async function triggerIdleNoise() {
+    if (!idleEnabled || idleSilenced) return;
+
+    // Never interrupt an ongoing recording or reply playback; just
+    // re-schedule instead of counting the skipped window as a noise.
+    const isRecording = mediaRecorder && mediaRecorder.state === "recording";
+    if (isSpeaking || isRecording) {
+        scheduleNextIdleNoise();
+        return;
+    }
+
+    idleCount += 1;
+    const formData = new FormData();
+    formData.append("current_skin", currentSkin);
+    formData.append("idle_count", idleCount);
+
+    try {
+        const response = await fetch("/api/idle-noise", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+        playClickNoise(data.audio_url + "?t=" + new Date().getTime(),
+                       data.emotion, Boolean(data.is_final));
+
+        if (data.is_final) {
+            // Sad noise delivered: no further idle noises until the
+            // user interacts again.
+            idleSilenced = true;
+            stopIdleTimer();
+            return;
+        }
+        // Random spacing between consecutive idle noises
+        idleTimer = setTimeout(triggerIdleNoise,
+                               (data.next_delay || 10) * 1000);
+    } catch (err) {
+        console.error("Idle noise transmission breakdown:", err);
+        scheduleNextIdleNoise();
+    }
+}
+
+// =====================================================================
+// 7. SETTINGS MENU (swap character, volume, idle-noise toggle)
+// =====================================================================
+const settingsBtn = document.getElementById("settings-btn");
+const settingsOverlay = document.getElementById("settings-overlay");
+const settingsCloseBtn = document.getElementById("settings-close-btn");
+const swapCharacterBtn = document.getElementById("swap-character-btn");
+const volumeSlider = document.getElementById("volume-slider");
+const idleNoiseToggle = document.getElementById("idle-noise-toggle");
+
+settingsBtn.addEventListener("click", () => {
+    settingsOverlay.style.display = "flex";
+    resetIdleCycle();
+});
+
+settingsCloseBtn.addEventListener("click", () => {
+    settingsOverlay.style.display = "none";
+    resetIdleCycle();
+});
+
+// Swap character returns to the selection screen (same as the old
+// swap button at the bottom of the screen)
+swapCharacterBtn.addEventListener("click", () => {
+    stopIdleTimer();
+    settingsOverlay.style.display = "none";
+    mainScreen.style.display = "none";
+    selectionScreen.style.display = "block";
+});
+
+volumeSlider.addEventListener("input", () => {
+    masterVolume = volumeSlider.value / 100;
+});
+
+idleNoiseToggle.addEventListener("change", () => {
+    idleEnabled = idleNoiseToggle.checked;
+    if (idleEnabled) {
+        resetIdleCycle();
+    } else {
+        stopIdleTimer();
+    }
+});
 
 </script>
 </body>

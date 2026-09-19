@@ -2,6 +2,7 @@ import os
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from audio_tools import (normalize_audio, detect_melody, synthesise_output,
                          determine_emotion, generate_click_noise,
+                         generate_idle_noise, get_idle_noise_delay,
                          add_to_memory, short_term_memory)
 
 app = Flask(__name__)
@@ -168,6 +169,78 @@ def character_click():
         "skin": character_name,
         "emotion": emotion
     })
+
+
+@app.route("/api/idle-noise", methods=["POST"])
+def idle_noise():
+    """
+    Handles the character's idle noises in the web app interface.
+
+    Expects a POST form with:
+        - "current_skin" (optional): active character name; defaults
+          to "default_cat" if blank.
+        - "idle_count" (optional): how many idle noises have already
+          been emitted in the current idle session; defaults to 0 if
+          blank or unparseable.
+
+    Synthesises the idle noise into data/responses/system_idle.wav:
+    while the idle count is below IDLE_NOISE_MAX_COUNT the noise is one
+    of the preset happy/confused/angry melodies (or occasionally a
+    randomly chosen melody recalled from the short-term memory); once
+    the count is reached the preset sad noise is delivered with the
+    "sad" emotion instead and "is_final" is True — the frontend must
+    stop scheduling idle noises after it. This file is deliberately
+    separate from system_reply.wav (direct user interactions) and
+    system_noise.wav (pokes).
+
+    Returns:
+        Response: JSON payload with keys:
+            - "audio_url" (str): URL of the idle noise .wav.
+            - "skin" (str): The active character name.
+            - "emotion" (str): The idle noise emotion.
+            - "is_final" (bool): True when the final sad noise played;
+              no further idle noises may be requested.
+    """
+    character_name = request.form.get("current_skin", "default_cat")
+    try:
+        idle_count = int(request.form.get("idle_count", 0))
+    except (TypeError, ValueError):
+        idle_count = 0
+
+    idle_audio_filename = "system_idle.wav"
+    idle_audio_path = os.path.join(RESPONSE_FOLDER, idle_audio_filename)
+
+    emotion, is_final = generate_idle_noise(
+        character=character_name,
+        idle_count=idle_count,
+        output_filename=idle_audio_path,
+        memory=short_term_memory
+    )
+
+    return jsonify({
+        "audio_url": f"/stream-audio/{idle_audio_filename}",
+        "skin": character_name,
+        "emotion": emotion,
+        "is_final": is_final,
+        "next_delay": get_idle_noise_delay()
+    })
+
+
+@app.route("/api/idle-delay")
+def idle_delay():
+    """
+    Provides the randomly spaced waiting time before the next idle
+    character noise.
+
+    The frontend schedules each idle noise after a random delay so
+    consecutive noises never arrive at a fixed interval; this endpoint
+    draws that delay from :func:`get_idle_noise_delay` (uniform between
+    IDLE_NOISE_MIN_DELAY and IDLE_NOISE_MAX_DELAY seconds).
+
+    Returns:
+        Response: JSON payload with key "delay" (float seconds).
+    """
+    return jsonify({"delay": get_idle_noise_delay()})
 
 
 @app.route("/stream-audio/<filename>")

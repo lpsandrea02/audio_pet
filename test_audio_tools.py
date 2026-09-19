@@ -36,6 +36,7 @@ from audio_tools import (
     synthesise_output,
     _get_raw_audio_duration,
     determine_emotion,
+    CONFUSED_MELODY,
     VOICE_PROFILES,
     EMOTION_PROFILES,
 )
@@ -1092,6 +1093,329 @@ class TestGenerateClickNoiseMemory(AudioToolsTestCase):
         sr, data = wavfile.read(out_path)
         self.assertEqual(len(data), self._melody_frames([{"pitch": "C5",
                                                           "duration": 0.3}]))
+
+
+# ---------------------------------------------------------------------
+# Idle character noises feature
+# ---------------------------------------------------------------------
+# The idle-noise API does not exist before the feature is implemented;
+# the imports are guarded so the baseline suite stays runnable in the
+# red phase and the new tests report as "expected failure: not
+# implemented yet" instead of crashing collection.
+try:
+    from audio_tools import (
+        IDLE_NOISE_MIN_DELAY,
+        IDLE_NOISE_MAX_DELAY,
+        IDLE_NOISE_MAX_COUNT,
+        SAD_NOISE_MELODY,
+        get_idle_noise_delay,
+        pick_idle_noise,
+        should_emit_idle_noise,
+        generate_idle_noise,
+    )
+    IDLE_API_AVAILABLE = True
+except ImportError:
+    IDLE_API_AVAILABLE = False
+
+
+IDLE_API_PENDING = "idle-noise API not implemented yet"
+
+# Distinct-length memory logs so rendered wav length reveals which
+# melody was used (they also differ from every preset melody length).
+IDLE_MEMORY_LOG_A = [{"pitch": "E6", "duration": 0.35}]
+IDLE_MEMORY_LOG_B = [
+    {"pitch": "D6", "duration": 0.2},
+    {"pitch": "C6", "duration": 0.25},
+]
+
+
+@unittest.skipUnless(IDLE_API_AVAILABLE, IDLE_API_PENDING)
+class TestIdleNoiseConstants(unittest.TestCase):
+    """The tunable idle-noise constants and the sad preset melody."""
+
+    def test_delay_range_is_valid(self):
+        self.assertIsInstance(IDLE_NOISE_MIN_DELAY, (int, float))
+        self.assertIsInstance(IDLE_NOISE_MAX_DELAY, (int, float))
+        self.assertGreater(IDLE_NOISE_MIN_DELAY, 0)
+        self.assertGreater(IDLE_NOISE_MAX_DELAY, IDLE_NOISE_MIN_DELAY)
+
+    def test_max_count_is_positive_int(self):
+        self.assertIsInstance(IDLE_NOISE_MAX_COUNT, int)
+        self.assertGreater(IDLE_NOISE_MAX_COUNT, 0)
+
+    def test_sad_melody_preset_sequence(self):
+        pitches = [note["pitch"] for note in SAD_NOISE_MELODY]
+        self.assertEqual(pitches, ['B5', 'A#5', 'A5', 'G#5', 'G5'])
+
+    def test_sad_melody_notes_parse_and_durations_positive(self):
+        self.assertGreater(len(SAD_NOISE_MELODY), 0)
+        for note in SAD_NOISE_MELODY:
+            self.assertIn("pitch", note)
+            self.assertIn("duration", note)
+            self.assertGreater(_get_frequency(note["pitch"]), 0.0)
+            self.assertGreater(float(note["duration"]), 0.0)
+
+    def test_sad_melody_distinct_length_from_other_presets(self):
+        # The sad noise's total duration must differ from every other
+        # preset melody so a rendered wav length proves which was used.
+        def frames(melody):
+            return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+        sad_frames = frames(SAD_NOISE_MELODY)
+        for preset in (HAPPY_NOISE_MELODY, ANGRY_NOISE_MELODY,
+                       CONFUSED_MELODY):
+            self.assertNotEqual(frames(preset), sad_frames)
+
+
+@unittest.skipUnless(IDLE_API_AVAILABLE, IDLE_API_PENDING)
+class TestGetIdleNoiseDelay(unittest.TestCase):
+    """Random idle-noise spacing between the min/max delay constants."""
+
+    def test_delay_within_default_range(self):
+        for _ in range(20):
+            delay = get_idle_noise_delay()
+            self.assertGreaterEqual(delay, IDLE_NOISE_MIN_DELAY)
+            self.assertLessEqual(delay, IDLE_NOISE_MAX_DELAY)
+
+    def test_delay_is_number(self):
+        self.assertIsInstance(get_idle_noise_delay(), (int, float))
+
+    def test_seeded_draw_is_deterministic(self):
+        np.random.seed(13)
+        first = get_idle_noise_delay()
+        np.random.seed(13)
+        second = get_idle_noise_delay()
+        self.assertEqual(first, second)
+
+    def test_custom_range_respected(self):
+        for _ in range(20):
+            delay = get_idle_noise_delay(min_delay=2.0, max_delay=5.0)
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 5.0)
+
+    def test_inverted_range_does_not_raise(self):
+        # Fail-safe: an inverted or zero-width range must never crash
+        # the caller; it should return a usable positive delay.
+        delay = get_idle_noise_delay(min_delay=30.0, max_delay=10.0)
+        self.assertIsInstance(delay, (int, float))
+        self.assertGreater(delay, 0)
+
+
+@unittest.skipUnless(IDLE_API_AVAILABLE, IDLE_API_PENDING)
+class TestPickIdleNoise(AudioToolsTestCase):
+    """Random selection among the idle noise options."""
+
+    def setUp(self):
+        self.PRESETS = (HAPPY_NOISE_MELODY, CONFUSED_MELODY,
+                        ANGRY_NOISE_MELODY)
+
+    def test_returns_melody_and_emotion_pair(self):
+        melody, emotion = pick_idle_noise()
+        self.assertIsInstance(melody, list)
+        self.assertGreater(len(melody), 0)
+        self.assertIsInstance(emotion, str)
+        self.assertIn(emotion, ("happy", "none", "confused", "angry"))
+
+    def test_without_memory_uses_preset_melodies(self):
+        for _ in range(20):
+            melody, emotion = pick_idle_noise(memory=None)
+            self.assertIn(melody, self.PRESETS)
+
+    def test_memory_probability_zero_uses_preset_melodies(self):
+        memory = [IDLE_MEMORY_LOG_A, IDLE_MEMORY_LOG_B]
+        for _ in range(20):
+            melody, emotion = pick_idle_noise(
+                memory=memory, memory_probability=0.0)
+            self.assertIn(melody, self.PRESETS)
+
+    def test_memory_probability_one_uses_memory_melody(self):
+        memory = [IDLE_MEMORY_LOG_A, IDLE_MEMORY_LOG_B]
+        for _ in range(20):
+            melody, emotion = pick_idle_noise(
+                memory=memory, memory_probability=1.0)
+            self.assertIn(melody, memory)
+
+    def test_empty_memory_falls_back_to_presets(self):
+        # Even at probability 1.0 there is nothing to recall from
+        memory = []
+        for _ in range(10):
+            melody, emotion = pick_idle_noise(
+                memory=memory, memory_probability=1.0)
+            self.assertIn(melody, self.PRESETS)
+
+    def test_seeded_draw_is_deterministic(self):
+        memory = [IDLE_MEMORY_LOG_A]
+        np.random.seed(17)
+        first = pick_idle_noise(memory=memory)
+        np.random.seed(17)
+        second = pick_idle_noise(memory=memory)
+        self.assertEqual(first, second)
+
+    def test_all_drawn_melodies_render_audibly(self):
+        # Every melody the picker can return must be renderable by the
+        # existing synthesise_output pipeline for every character voice.
+        melody, emotion = pick_idle_noise()
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"idle_{char}.wav")
+            result = synthesise_output(melody, out_path,
+                                       character=char, emotion=emotion)
+            self.assertEqual(result, emotion)
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            self.assertGreater(np.max(np.abs(data)), 100)
+
+
+@unittest.skipUnless(IDLE_API_AVAILABLE, IDLE_API_PENDING)
+class TestShouldEmitIdleNoise(unittest.TestCase):
+    """Gate that stops idle noises after the sad noise has played."""
+
+    def test_emits_below_max_count(self):
+        for idle_count in range(IDLE_NOISE_MAX_COUNT):
+            self.assertTrue(should_emit_idle_noise(idle_count))
+
+    def test_stops_at_max_count(self):
+        self.assertFalse(should_emit_idle_noise(IDLE_NOISE_MAX_COUNT))
+
+    def test_stays_stopped_beyond_max_count(self):
+        # After the sad noise no further idle noises are generated
+        for idle_count in range(IDLE_NOISE_MAX_COUNT,
+                                IDLE_NOISE_MAX_COUNT + 5):
+            self.assertFalse(should_emit_idle_noise(idle_count))
+
+    def test_seeded_draw_is_deterministic(self):
+        np.random.seed(19)
+        first = should_emit_idle_noise(0)
+        np.random.seed(19)
+        second = should_emit_idle_noise(0)
+        self.assertEqual(first, second)
+
+
+@unittest.skipUnless(IDLE_API_AVAILABLE, IDLE_API_PENDING)
+class TestGenerateIdleNoise(AudioToolsTestCase):
+    """Renders the idle noise into a dedicated wav file."""
+
+    @staticmethod
+    def _melody_frames(melody):
+        return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+
+    def test_sad_noise_at_max_count(self):
+        # Once the fixed number of idle noises is reached the character
+        # emits the sad noise with a sad emotion — and this is final.
+        out_path = os.path.join(self.tmpdir, "idle_sad.wav")
+        emotion, is_final = generate_idle_noise(
+            "default_cat", IDLE_NOISE_MAX_COUNT, out_path)
+        self.assertEqual(emotion, "sad")
+        self.assertTrue(is_final)
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(sr, SAMPLE_RATE)
+        self.assertEqual(len(data), self._melody_frames(SAD_NOISE_MELODY))
+        self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_sad_noise_beyond_max_count(self):
+        out_path = os.path.join(self.tmpdir, "idle_sad_beyond.wav")
+        emotion, is_final = generate_idle_noise(
+            "default_cat", IDLE_NOISE_MAX_COUNT + 3, out_path)
+        self.assertEqual(emotion, "sad")
+        self.assertTrue(is_final)
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(SAD_NOISE_MELODY))
+
+    def test_below_max_count_renders_valid_noise(self):
+        out_path = os.path.join(self.tmpdir, "idle_normal.wav")
+        for idle_count in range(IDLE_NOISE_MAX_COUNT):
+            np.random.seed(idle_count)
+            emotion, is_final = generate_idle_noise(
+                "default_cat", idle_count, out_path)
+            self.assertIn(emotion, ("happy", "none", "confused", "angry"))
+            self.assertIsInstance(emotion, str)
+            self.assertFalse(is_final)
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_memory_used_at_probability_one_below_max_count(self):
+        memory = [IDLE_MEMORY_LOG_A, IDLE_MEMORY_LOG_B]
+        out_path = os.path.join(self.tmpdir, "idle_memory.wav")
+        emotion, is_final = generate_idle_noise(
+            "default_cat", 0, out_path,
+            memory=memory, memory_probability=1.0)
+        self.assertFalse(is_final)
+        self.assertIn(emotion, ("happy", "none"))
+        sr, data = wavfile.read(out_path)
+        self.assertIn(len(data),
+                      [self._melody_frames(m) for m in memory])
+
+    def test_sad_noise_never_touches_system_reply_wav(self):
+        # system_reply.wav is reserved for direct user-to-audiopet
+        # interactions: idle noises must never write or overwrite it.
+        reply_path = os.path.join(self.tmpdir, "system_reply.wav")
+        write_wav(reply_path, make_tone(440.0, 0.5))
+        with open(reply_path, "rb") as f:
+            reply_before = f.read()
+        idle_path = os.path.join(self.tmpdir, "system_idle.wav")
+        generate_idle_noise("default_cat", IDLE_NOISE_MAX_COUNT, idle_path)
+        self.assertTrue(os.path.exists(reply_path))
+        with open(reply_path, "rb") as f:
+            self.assertEqual(f.read(), reply_before)
+
+    def test_sad_noise_does_not_create_system_reply_wav_if_absent(self):
+        reply_path = os.path.join(self.tmpdir, "system_reply.wav")
+        if os.path.exists(reply_path):
+            os.remove(reply_path)
+        idle_path = os.path.join(self.tmpdir, "system_idle_only.wav")
+        generate_idle_noise("default_cat", IDLE_NOISE_MAX_COUNT, idle_path)
+        self.assertFalse(os.path.exists(reply_path))
+
+    def test_unknown_character_falls_back_to_default(self):
+        out_path = os.path.join(self.tmpdir, "idle_unknown_char.wav")
+        emotion, is_final = generate_idle_noise(
+            "not_a_character", IDLE_NOISE_MAX_COUNT, out_path)
+        self.assertEqual(emotion, "sad")
+        self.assertTrue(is_final)
+        self.assertTrue(os.path.exists(out_path))
+
+    def test_every_voice_renders_idle_noise(self):
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"idle_{char}.wav")
+            emotion, is_final = generate_idle_noise(
+                char, IDLE_NOISE_MAX_COUNT, out_path)
+            self.assertEqual(emotion, "sad")
+            self.assertTrue(is_final)
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_overwrites_previous_idle_file(self):
+        # A stale/longer idle wav must be fully replaced, never
+        # appended to or left behind from an earlier idle noise.
+        out_path = os.path.join(self.tmpdir, "idle_overwrite.wav")
+        write_wav(out_path, make_tone(220.0, 20.0))
+        emotion, is_final = generate_idle_noise(
+            "default_cat", IDLE_NOISE_MAX_COUNT, out_path)
+        self.assertEqual(emotion, "sad")
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(SAD_NOISE_MELODY))
+
+
+# ---------------------------------------------------------------------
+# Baseline: existing preset melodies under the sad emotion delivery
+# ---------------------------------------------------------------------
+class TestPresetMelodiesUnderSadEmotion(AudioToolsTestCase):
+    """All preset melodies must render under the new 'sad' delivery."""
+
+    def test_presets_render_with_sad_emotion(self):
+        for preset in (HAPPY_NOISE_MELODY, ANGRY_NOISE_MELODY,
+                       CONFUSED_MELODY):
+            out_path = os.path.join(
+                self.tmpdir, f"sad_{len(preset)}_{preset[0]['pitch']}.wav")
+            result = synthesise_output(preset, out_path,
+                                       character="default_cat", emotion="sad")
+            self.assertEqual(result, "sad")
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            expected_frames = int(
+                SAMPLE_RATE * sum(float(n["duration"]) for n in preset))
+            self.assertEqual(len(data), expected_frames)
+            self.assertGreater(np.max(np.abs(data)), 100)
 
 
 if __name__ == "__main__":
