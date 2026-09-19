@@ -263,7 +263,7 @@ recordBtn.addEventListener("click", async () => {
         mediaRecorder.stop();
         recordBtn.textContent = "Record Input";
         recordBtn.classList.remove("recording");
-        statusText.textContent = "Status: Transmitting wave file...";
+        statusText.textContent = "Status: Transmitting audio...";
     } else {
         audioChunks = [];
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -271,7 +271,11 @@ recordBtn.addEventListener("click", async () => {
         
         mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
         mediaRecorder.onstop = async () => {
-            const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+            // MediaRecorder emits the browser's native container
+            // (webm/ogg/mp4), NOT wav — label the blob truthfully so
+            // the backend knows the real format it received.
+            const mimeType = mediaRecorder.mimeType || "audio/webm";
+            const audioBlob = new Blob(audioChunks, { type: mimeType });
             await sendToFlaskBackend(audioBlob);
         };
 
@@ -284,7 +288,10 @@ recordBtn.addEventListener("click", async () => {
 
 async function sendToFlaskBackend(blob) {
     const formData = new FormData();
-    formData.append("file", blob, "user_mic_input.wav");
+    const extension = blob.type.includes("ogg") ? "ogg"
+        : blob.type.includes("mp4") ? "mp4"
+        : blob.type.includes("wav") ? "wav" : "webm";
+    formData.append("file", blob, `user_mic_input.${extension}`);
     formData.append("current_skin", currentSkin);
 
     // 1. SET STATUS IMMEDIATELY TO "Thinking..." DURING DYNAMIC GENERATION

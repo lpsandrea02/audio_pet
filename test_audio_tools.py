@@ -11,6 +11,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,8 @@ import wave
 
 import numpy as np
 import scipy.io.wavfile as wavfile
+
+FFMPEG = shutil.which("ffmpeg")
 
 from audio_tools import (
     normalize_audio,
@@ -106,6 +109,21 @@ class AudioToolsTestCase(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir)
 
+    @classmethod
+    def make_webm(cls, name, duration=1.0, freq=440.0):
+        """Generate a real webm audio file via ffmpeg, named with a .wav
+        extension to replicate the browser's mislabeled MediaRecorder
+        upload (Blob type "audio/wav" wrapping webm bytes)."""
+        target = os.path.join(cls.tmpdir, name)
+        encoded = os.path.join(cls.tmpdir, name + ".encoded.webm")
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi",
+             "-i", f"sine=frequency={freq}:duration={duration}",
+             "-c:a", "libopus", encoded],
+            capture_output=True, check=True)
+        os.replace(encoded, target)
+        return target
+
 
 # ---------------------------------------------------------------------
 # Note utility functions
@@ -161,6 +179,28 @@ class TestNormalizeAudio(AudioToolsTestCase):
     def test_silent_audio_writes_nothing(self):
         out_path = os.path.join(self.tmpdir, "silent_boosted.wav")
         normalize_audio(self.silent_wav, out_path)
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_undecodable_input_writes_nothing(self):
+        # NEW behaviour: garbage input fail-safes instead of raising
+        # (baseline: librosa.load raises NoBackendError, crashing the
+        # Flask request in app.py).
+        out_path = os.path.join(self.tmpdir, "corrupt_boosted.wav")
+        normalize_audio(self.corrupt_wav, out_path)
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_missing_input_writes_nothing(self):
+        out_path = os.path.join(self.tmpdir, "missing_boosted.wav")
+        normalize_audio(os.path.join(self.tmpdir, "nope.wav"), out_path)
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_stale_output_removed_on_undecodable_input(self):
+        # A previous valid normalisation must not linger: stale output
+        # would otherwise be re-analysed by detect_melody() downstream.
+        out_path = os.path.join(self.tmpdir, "stale_boosted.wav")
+        normalize_audio(self.melody_wav, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        normalize_audio(self.corrupt_wav, out_path)
         self.assertFalse(os.path.exists(out_path))
 
 
@@ -332,6 +372,139 @@ class TestDurationAndEmotion(AudioToolsTestCase):
             choices=["none", "happy", "sad", "angry"],
             probabilities=[1.0, 0.0, 0.0, 0.0])
         self.assertEqual(emotion, "none")
+
+
+# ---------------------------------------------------------------------
+# Raw duration reading across container formats (mislabeled uploads)
+# ---------------------------------------------------------------------
+@unittest.skipUnless(FFMPEG, "ffmpeg required to synthesise webm fixtures")
+class TestRawAudioDurationFormats(AudioToolsTestCase):
+    """Tests for _get_raw_audio_duration with non-WAV containers.
+
+    The browser MediaRecorder emits webm/ogg bytes even though the
+    frontend labels them "audio/wav", so the saved input file is often
+    a webm file with a .wav extension. BASELINE: wave.open raises
+    "file does not start with RIFF id" and the duration defaults to
+    0.0, silently disabling the determine_emotion() timeline check.
+    NEW behaviour: fall back to librosa so real browser uploads are
+    measured correctly; only truly undecodable input yields 0.0.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.webm_as_wav = cls.make_webm("browser_upload.wav")
+        with open(cls.webm_as_wav, "rb") as f:
+            cls.webm_bytes = f.read()
+
+    def test_duration_from_mislabeled_webm_path(self):
+        # BASELINE: 0.0 (RIFF error). NEW: ~1.0 via the librosa fallback.
+        duration = _get_raw_audio_duration(self.webm_as_wav)
+        self.assertAlmostEqual(duration, 1.0, delta=0.05)
+
+    def test_duration_from_webm_bytes(self):
+        # BASELINE: 0.0. NEW: ~1.0 via the librosa fallback.
+        duration = _get_raw_audio_duration(self.webm_bytes)
+        self.assertAlmostEqual(duration, 1.0, delta=0.05)
+
+    def test_wav_still_uses_fast_wave_path(self):
+        # Existing behaviour must be preserved for genuine WAVs.
+        duration = _get_raw_audio_duration(self.one_sec_wav)
+        self.assertAlmostEqual(duration, 1.0, delta=0.05)
+
+    def test_garbage_bytes_fail_safe_to_zero(self):
+        # Neither wave nor librosa can decode random garbage; must
+        # return 0.0 without raising.
+        with open(self.corrupt_wav, "rb") as f:
+            duration = _get_raw_audio_duration(f.read())
+        self.assertEqual(duration, 0.0)
+
+    def test_garbage_path_fail_safe_to_zero(self):
+        self.assertEqual(_get_raw_audio_duration(self.corrupt_wav), 0.0)
+
+    def test_none_input_returns_zero(self):
+        self.assertEqual(_get_raw_audio_duration(None), 0.0)
+
+    def test_missing_path_returns_zero(self):
+        self.assertEqual(
+            _get_raw_audio_duration(os.path.join(self.tmpdir, "nope.wav")),
+            0.0)
+
+
+# ---------------------------------------------------------------------
+# determine_emotion() robustness and end-to-end emotion decisions
+# ---------------------------------------------------------------------
+@unittest.skipUnless(FFMPEG, "ffmpeg required to synthesise webm fixtures")
+class TestDetermineEmotionEdgeCases(AudioToolsTestCase):
+    """Edge-case and integration tests for determine_emotion()."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.webm_as_wav = cls.make_webm("browser_upload.wav")
+
+    def test_none_melody_log_returns_confused(self):
+        # BASELINE: TypeError from sum() over None. NEW: graceful
+        # "confused", mirroring synthesise_output's empty-log fallback.
+        self.assertEqual(determine_emotion(None, self.one_sec_wav), "confused")
+
+    def test_missing_duration_key_treated_as_zero(self):
+        # Notes without a "duration" key contribute 0.0 and must not crash.
+        melody_log = [{"pitch": "D5"}]
+        self.assertEqual(
+            determine_emotion(melody_log, self.one_sec_wav), "confused")
+
+    def test_none_duration_value_treated_as_zero(self):
+        melody_log = [{"pitch": "D5", "duration": None}]
+        self.assertEqual(
+            determine_emotion(melody_log, self.one_sec_wav), "confused")
+
+    def test_misaligned_melody_vs_mislabeled_webm_is_confused(self):
+        # THE core integration bug: melody 0.3s vs ~1.0s webm upload
+        # mislabeled as .wav. BASELINE: unreadable duration -> 0.0 ->
+        # check silently disabled -> random "none"/"happy".
+        # NEW: timeline check fires -> "confused".
+        melody_log = [{"pitch": "D5", "duration": 0.3}]
+        self.assertEqual(
+            determine_emotion(melody_log, self.webm_as_wav), "confused")
+
+    def test_aligned_melody_vs_mislabeled_webm_not_confused(self):
+        # Melody covering >= 75% of the webm timeline must reach the
+        # random draw instead of being forced to "confused".
+        melody_log = [{"pitch": "D5", "duration": 1.0}]
+        emotion = determine_emotion(
+            melody_log, self.webm_as_wav,
+            choices=["none", "happy", "sad", "angry"],
+            probabilities=[1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(emotion, "none")
+
+    def test_unreadable_input_with_melody_uses_random_draw(self):
+        # Completely undecodable raw input: the timeline check cannot
+        # run, so the weighted random draw still decides (with the
+        # caveat logged). Deterministic weights pin the outcome.
+        melody_log = [{"pitch": "D5", "duration": 0.3}]
+        with open(self.corrupt_wav, "rb") as f:
+            raw_bytes = f.read()
+        emotion = determine_emotion(
+            melody_log, raw_bytes,
+            choices=["none", "happy", "sad", "angry"],
+            probabilities=[0.0, 1.0, 0.0, 0.0])
+        self.assertEqual(emotion, "happy")
+
+    def test_empty_melody_is_confused_even_with_unreadable_input(self):
+        # No melody at all is always a confused response, regardless
+        # of whether the raw input can be decoded.
+        self.assertEqual(
+            determine_emotion([], self.corrupt_wav), "confused")
+
+    def test_result_is_plain_str(self):
+        # np.random.choice returns numpy str_; callers (app.py /
+        # synthesise_output dict lookups) must receive a plain str.
+        melody_log = [{"pitch": "D5", "duration": 1.0}]
+        emotion = determine_emotion(
+            melody_log, self.one_sec_wav,
+            choices=["none", "happy"], probabilities=[1.0, 0.0])
+        self.assertIsInstance(emotion, str)
 
 
 if __name__ == "__main__":

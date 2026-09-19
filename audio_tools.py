@@ -23,6 +23,10 @@ import numpy as np
 import scipy.io.wavfile as wavfile
 import librosa
 import io
+import os
+import shutil
+import tempfile
+import warnings
 import wave
 
 VOICE_PROFILES = {
@@ -68,9 +72,29 @@ def normalize_audio(input_wav, output_wav):
 
     Returns:
         None. Writes the normalised audio to ``output_wav``. Prints a
-        warning and writes nothing if the input is completely silent.
+        warning and writes nothing if the input is completely silent,
+        missing, or undecodable (fail-safe: any decode error is caught
+        rather than raised, so the downstream melody pipeline can
+        respond with the confused-noise fallback instead of crashing).
     """
-    data, sr = librosa.load(input_wav, sr=None)
+    # Remove any stale output first so a failed/skipped normalisation
+    # can never leave an old recording behind for detect_melody() to
+    # re-analyse.
+    if os.path.exists(output_wav):
+        os.remove(output_wav)
+
+    try:
+        with warnings.catch_warnings():
+            # Compressed containers (browser webm/ogg uploads) decode
+            # through audioread's deprecated fallback; silence the
+            # deprecation noise so the pipeline log stays readable.
+            warnings.simplefilter("ignore", FutureWarning)
+            warnings.simplefilter("ignore", UserWarning)
+            data, sr = librosa.load(input_wav, sr=None)
+    except Exception as e:
+        reason = str(e).strip() or type(e).__name__
+        print(f"⚠️ Could not decode '{input_wav}': {reason}. Skipping normalisation.")
+        return
     
     # Convert integer PCM data to float for calculations
     float_data = data.astype(np.float32)
@@ -408,32 +432,95 @@ def synthesise_output(melody_log,
     print(f"💾 Rendered -> {output_filename} ({character} + {emotion})")
     return emotion
 
+def _wave_duration(source):
+    """
+    Reads duration (in seconds) from a WAV source via the built-in
+    ``wave`` module (RIFF/WAV only).
+
+    Args:
+        source (str or file-like): Path to a .wav file, or an open
+        binary stream positioned at the start of the RIFF data.
+
+    Returns:
+        float: Audio duration in seconds.
+
+    Raises:
+        Any ``wave.Error``/I/O failure propagates to the caller.
+    """
+    with wave.open(source, 'rb') as wav_file:
+        return wav_file.getnframes() / float(wav_file.getframerate())
+
+
+def _librosa_duration_from_file(path):
+    """
+    Reads duration (in seconds) from any audio file librosa can decode
+    (wav, webm, ogg, mp3, flac, ... via soundfile/audioread).
+
+    Args:
+        path (str): Path to the audio file.
+
+    Returns:
+        float: Audio duration in seconds.
+
+    Raises:
+        Exception: Propagates if no decoder could handle the file.
+    """
+    with warnings.catch_warnings():
+        # audioread's ffmpeg fallback is deprecated but is currently
+        # the only route that decodes browser webm uploads; silence
+        # the noise so the pipeline log stays readable.
+        warnings.simplefilter("ignore", FutureWarning)
+        return float(librosa.get_duration(path=path))
+
+
 def _get_raw_audio_duration(input_path):
     """
     Extracts the duration (in seconds) from a raw audio input.
     Accepts either a string file path or a bytes/file-like object.
 
+    Uses the fast built-in ``wave`` reader first (RIFF/WAV only). If
+    the input is not a RIFF file (e.g. a browser MediaRecorder webm
+    upload mislabeled as .wav), it falls back to librosa, which
+    decodes compressed containers such as webm, ogg, mp3, and flac.
+
     Args:
-        input_path (str, bytes, or file-like): Path to a .wav file,
-            raw .wav bytes, or an in-memory stream readable by
-            ``wave.open``.
+        input_path (str, bytes, or file-like): Path to an audio file,
+            raw audio bytes, or an in-memory stream.
 
     Returns:
-        float: Audio duration in seconds, or 0.0 if the audio
-        properties could not be read.
+        float: Audio duration in seconds, or 0.0 if the audio could
+        not be decoded by any available reader.
     """
     try:
-        # If it's a file path string
         if isinstance(input_path, str):
-            with wave.open(input_path, 'rb') as wav_file:
-                return wav_file.getnframes() / float(wav_file.getframerate())
-        # If it's a bytes object or an in-memory BytesIO stream
-        else:
-            file_stream = io.BytesIO(input_path) if isinstance(input_path, bytes) else input_path
-            with wave.open(file_stream, 'rb') as wav_file:
-                return wav_file.getnframes() / float(wav_file.getframerate())
+            try:
+                return _wave_duration(input_path)
+            except Exception:
+                return _librosa_duration_from_file(input_path)
+
+        # bytes object or in-memory stream: the wave reader can try
+        # it directly, but compressed containers must be materialised
+        # to a temp file for the ffmpeg-based fallback to read.
+        file_stream = io.BytesIO(input_path) if isinstance(input_path, bytes) else input_path
+        try:
+            return _wave_duration(file_stream)
+        except Exception:
+            position = None
+            try:
+                position = file_stream.tell()
+                file_stream.seek(0)
+            except (AttributeError, OSError):
+                pass
+            with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+                shutil.copyfileobj(file_stream, tmp)
+                tmp_path = tmp.name
+            try:
+                return _librosa_duration_from_file(tmp_path)
+            finally:
+                os.unlink(tmp_path)
     except Exception as e:
-        print(f"Error reading raw audio properties: {e}. Defaulting duration comparison to 0.")
+        print(f"Could not determine raw audio duration ({e}). "
+              "Defaulting duration comparison to 0.")
         return 0.0
 
 def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
@@ -446,11 +533,18 @@ def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
     forced to "confused". Otherwise, an emotion is drawn at random
     from the given choices with the given probability weights.
 
+    Fail-safe behaviour:
+    - An empty or None ``melody_log`` always yields "confused"
+      (mirroring the confused-noise fallback in :func:`synthesise_output`).
+    - If the raw input's duration cannot be read at all (0.0), the
+      timeline check cannot run, so the weighted random draw decides
+      and the caveat is logged.
+
     Parameters:
     - melody_log (list[dict]): List of dicts, e.g.,
       [{"pitch": "C5", "duration": 0.25}, ...]
     - input_path (str or bytes): A file path string
-      (e.g. "recording.wav") OR raw wav bytes.
+      (e.g. "recording.wav") OR raw audio bytes.
     - choices (list[str], optional): List of available emotion strings.
       Defaults to ["none", "happy", "sad", "angry"].
     - probabilities (list[float], optional): List of float weights
@@ -460,21 +554,38 @@ def determine_emotion(melody_log, input_path, choices=None, probabilities=None):
         str: The chosen emotion, either "confused" (timeline mismatch)
         or one of ``choices`` sampled according to ``probabilities``.
     """
-    # Predict melody duration by summing up note lengths inside the log
-    predicted_duration = sum(step.get("duration", 0.0) for step in melody_log)
-    
+    # Fail-safe: no detected melody at all is always a confused
+    # response, even if the raw input itself cannot be decoded.
+    if not melody_log:
+        return "confused"
+
+    # Predict melody duration by summing up note lengths inside the log,
+    # tolerating missing or invalid per-note durations
+    predicted_duration = 0.0
+    for step in melody_log:
+        try:
+            predicted_duration += float(step.get("duration") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+
     # Extract actual time from the raw audio input
     actual_duration = _get_raw_audio_duration(input_path)
-    
+
     # CRITERION 1: If the response is significantly shorter than the input clip, default to confused
-    if predicted_duration < (actual_duration * 0.75):
+    if actual_duration > 0.0 and predicted_duration < (actual_duration * 0.75):
         print(f"🧐 Timeline mismatch! (Melody: {predicted_duration:.2f}s vs Raw: {actual_duration:.2f}s) -> Overriding to Confused.")
         return "confused"
-    
+
+    if actual_duration <= 0.0:
+        print("⚠️ Raw input duration unreadable; timeline check skipped, using default emotion draw.")
+
     # Default probability distribution 
     if choices is None or probabilities is None:
         choices =       ["none", "happy", "sad", "angry"]
         probabilities = [0.70,   0.30,    0.00,  0.00] 
         
-    # CRITERION 2: Manually adjustable random probability assignment
-    return np.random.choice(choices, p=probabilities)
+    # CRITERION 2: Manually adjustable random probability assignment.
+    # np.random.choice returns numpy str_; coerce to a plain str so
+    # downstream dict lookups (EMOTION_PROFILES, Flask JSON payload)
+    # behave like ordinary strings.
+    return str(np.random.choice(choices, p=probabilities))
