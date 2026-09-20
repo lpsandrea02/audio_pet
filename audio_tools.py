@@ -44,6 +44,19 @@ Constants:
         frame length the WebRTC voice-activity gate runs at.
     VAD_VOICED_FRAME_RATIO / VAD_AGGRESSIVENESS (float, int): Tunables
         of the voice-activity gate in front of chunk note detection.
+    LESSON_MEMORY_SIZE (int): Capacity of the separate long-term memory
+        used by lesson mode: the number of finished (learned) melodies
+        kept for later recall.
+    LESSON_MEMORY_SING_PROBABILITY (float): Probability that a click or
+        idle noise recalls a melody from the long-term lesson memory
+        instead of playing a preset noise.
+    LESSON_REDO_ANGRY_PROBABILITY (float): Probability that the noise
+        made before a Redo Previous Section recording is the angry
+        noise instead of the confused noise.
+    LESSON_MISTAKE_PROBABILITY (float): Probability that the Audiopet
+        makes a mistake in the middle of the melody while rehearsing it
+        during Learn Melody (it then sings a confused noise and
+        rehearses the whole sequence correctly a second time).
 """
 
 import aubio
@@ -243,6 +256,385 @@ def should_sing_from_memory(memory, sing_probability=None):
         return False
 
     return bool(np.random.random() < sing_probability)
+
+
+# =====================================================================
+# LESSON MODE (separate long-term memory of learned melodies)
+# =====================================================================
+
+# Lesson mode teaches melodies section by section: the user records one
+# section at a time, the pet sings the melody accumulated so far back,
+# and once the user is satisfied the full melody is "learned" into a
+# separate long-term memory (independent of the rolling short-term
+# memory above) from which click and idle noises may later recall it.
+
+# Capacity of the long-term lesson memory (the number of finished
+# melodies kept; customisable) and the probability that a click or idle
+# noise recalls a melody from it instead of playing a preset noise
+# (controllable).
+LESSON_MEMORY_SIZE = 20
+LESSON_MEMORY_SING_PROBABILITY = 0.10
+
+# Separate long-term memory of learned (finished) melodies. Kept
+# strictly independent of ``short_term_memory`` so lesson recall never
+# competes with the rolling short-term cache; see
+# :func:`add_to_lesson_memory`.
+long_term_memory = []
+
+
+def combine_melody_sections(sections):
+    """
+    Concatenates the taught lesson sections into the full melody log.
+
+    Lesson mode records one section at a time; before the pet sings the
+    melody back (and before a finished melody is learned), the stored
+    sections are flattened into a single melody log in teaching order.
+    Only valid sections are merged (see :func:`_is_valid_melody_log`):
+    empty, malformed, or None sections are skipped. The result is a
+    fresh list of per-note copies, so later mutation of the caller's
+    sections cannot corrupt the combined melody.
+
+    Args:
+        sections (list[list[dict]] or None): Taught sections in order,
+            each a melody log of {"pitch": str, "duration": float}
+            dicts (as produced by :func:`detect_melody` chunks merged
+            with :func:`extend_melody_log`).
+
+    Returns:
+        list[dict]: The combined melody log (a new list; inputs are
+        never mutated), or an empty list for empty/None input or when
+        no section is valid.
+    """
+    if not sections:
+        return []
+
+    combined = []
+    for section in sections:
+        if not _is_valid_melody_log(section):
+            continue
+        combined.extend({**step} for step in section)
+    return combined
+
+
+def replace_last_section(sections, new_notes):
+    """
+    Replaces the latest taught section with a new (redo) recording.
+
+    The "Redo Previous Section" flow: the latest section is swapped for
+    the newly recorded notes while all earlier sections are kept in
+    place — sections are replaced, never appended. Fail-safe behaviour:
+    if ``new_notes`` is invalid (an empty, malformed, or failed
+    recording) the previous sections are kept unchanged rather than
+    wiping the taught melody, and an empty/None ``sections`` list
+    simply makes the new recording the first section. The result is a
+    fresh list of per-note copies; inputs are never mutated.
+
+    Args:
+        sections (list[list[dict]] or None): Taught sections in order
+            (may be empty or None).
+        new_notes (list[dict]): Notes detected in the redo recording.
+            Invalid or empty input keeps the previous sections.
+
+    Returns:
+        list[list[dict]]: The new sections list (a new list; inputs are
+        never mutated). Invalid sections are skipped.
+    """
+    kept = []
+    for section in (sections or []):
+        if _is_valid_melody_log(section):
+            kept.append([{**step} for step in section])
+
+    if not _is_valid_melody_log(new_notes):
+        return kept
+
+    new_section = [{**step} for step in new_notes]
+    if kept:
+        kept[-1] = new_section
+    else:
+        kept.append(new_section)
+    return kept
+
+
+def generate_lesson_reply(melody_log,
+                          output_filename="system_lesson_reply.wav",
+                          character="default_cat"):
+    """
+    Synthesises the Audiopet's lesson-mode reply and writes it to a
+    dedicated lesson reply file.
+
+    The full melody taught so far (all sections combined by
+    :func:`combine_melody_sections`) is rendered in the character's
+    voice with a randomly drawn happy or neutral delivery (same
+    weighted ``np.random.choice`` structure as the rest of the
+    behaviour logic; the draw fires before any synthesis). If the
+    melody is empty or None the preset confused noise is synthesised
+    with the "confused" emotion instead (the ``synthesise_output``
+    fallback). The result must never be written to ``system_reply.wav``
+    (reserved for the standard recording pipeline),
+    ``system_noise.wav`` (reserved for pokes) or ``system_idle.wav``
+    (reserved for idle noises): callers pass a separate path (e.g.
+    ``data/responses/system_lesson_reply.wav``).
+
+    Parameters:
+    - melody_log (list[dict]): Full melody taught so far (as built by
+      :func:`combine_melody_sections`). An empty or None log renders
+      the confused noise fallback.
+    - output_filename (str, optional): Path of the .wav file to write.
+      Defaults to "system_lesson_reply.wav".
+    - character (str, optional): Key into ``VOICE_PROFILES``; falls
+      back to "default_cat" if unknown. Defaults to "default_cat".
+
+    Returns:
+        str: The emotion actually used for the synthesis ("happy",
+        "none", or "confused" when the fallback fired).
+    """
+    emotion = str(np.random.choice(["none", "happy"], p=[0.70, 0.30]))
+    return synthesise_output(melody_log,
+                             output_filename=output_filename,
+                             sample_rate=44100,
+                             character=character,
+                             emotion=emotion)
+
+
+def add_to_lesson_memory(melody_log, capacity=None, memory=None):
+    """
+    Stores a finished (learned) melody in the long-term lesson memory.
+
+    Reuses :func:`add_to_memory` unchanged: only valid melody logs are
+    stored, the log is stored as a nested copy so later mutation of the
+    caller's list cannot corrupt the memory, and once the memory
+    exceeds ``capacity`` the oldest entries are evicted. Unlike the
+    short-term memory, the default target is the separate module-level
+    ``long_term_memory`` (capacity ``LESSON_MEMORY_SIZE``, 20) so
+    learned melodies never evict or compete with the rolling
+    short-term cache. ``short_term_memory`` is never touched.
+
+    Args:
+        melody_log (list[dict]): The finished melody, one dict per
+            note: {"pitch": str, "duration": float}. Invalid or empty
+            logs are ignored.
+        capacity (int, optional): Maximum number of melodies to keep.
+            Defaults to ``LESSON_MEMORY_SIZE`` (20).
+        memory (list, optional): The long-term memory list to append
+            to. Defaults to the module-level ``long_term_memory``.
+
+    Returns:
+        list: The updated memory list (the same object passed in).
+    """
+    if capacity is None:
+        capacity = LESSON_MEMORY_SIZE
+    if memory is None:
+        memory = long_term_memory
+
+    return add_to_memory(melody_log, capacity=capacity, memory=memory)
+
+
+def pick_lesson_memory_melody(memory):
+    """
+    Picks a random learned melody from the long-term lesson memory.
+
+    Thin wrapper over :func:`pick_memory_melody` with the same
+    seeded-deterministic ``np.random`` draw structure as the rest of
+    the behaviour logic; kept as a named entry point so lesson recall
+    stays independently traceable (and re-seedable) from short-term
+    recall.
+
+    Args:
+        memory (list): List of stored (learned) melody logs (as
+            produced by :func:`add_to_lesson_memory`).
+
+    Returns:
+        list[dict]: One randomly chosen learned melody, or None if the
+        memory is empty or None (in which case the caller must fall
+        back to the default noise behaviour).
+    """
+    return pick_memory_melody(memory)
+
+
+# Probability that the Audiopet makes a mistake in the middle of the
+# melody while rehearsing it during Learn Melody (controllable): it
+# then sings a confused noise and rehearses the whole sequence
+# correctly a second time before the final happy noise.
+LESSON_MISTAKE_PROBABILITY = 0.25
+
+# Probability that the noise made before a Redo Previous Section
+# recording is the preset angry noise instead of the preset confused
+# noise (controllable).
+LESSON_REDO_ANGRY_PROBABILITY = 0.4
+
+
+def _note_name_to_midi(note_str):
+    """
+    Converts a standard scientific pitch note name to a MIDI number.
+
+    Inverse of :func:`midi_to_note_name`: "A4" maps back to 69.
+
+    Args:
+        note_str (str): Note name in scientific pitch notation
+            (e.g. "C5", "F#4").
+
+    Returns:
+        int: MIDI note number, or 0 for unparseable input.
+    """
+    chromatic_scale = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#',
+                       'G', 'G#', 'A', 'A#', 'B']
+    try:
+        note_str = str(note_str).strip()
+        note_name = note_str[:-1]
+        octave = int(note_str[-1])
+        return chromatic_scale.index(note_name) + (octave + 1) * 12
+    except (ValueError, IndexError, TypeError):
+        return 0
+
+
+def make_mistake_melody(melody_log, semitone_shifts=(-2, -1, 1, 2)):
+    """
+    Returns a copy of the melody with one middle note deliberately
+    mistuned, as the "mistake" the Audiopet makes while rehearsing a
+    melody during Learn Melody.
+
+    The note closest to the middle of the melody is transposed by a
+    random non-zero semitone shift drawn from ``semitone_shifts`` (the
+    same seeded-deterministic ``np.random`` draw structure as the rest
+    of the behaviour logic), so the rehearsed rendition sounds audibly
+    wrong but keeps every other note — and every duration — intact.
+    Only notes with a parseable pitch can be corrupted; if the melody
+    carries none, an unchanged copy is returned.
+
+    Fail-safe behaviour: empty, malformed, or None input returns an
+    empty list (the confused-noise fallback case), and the input is
+    never mutated.
+
+    Args:
+        melody_log (list[dict]): Melody to corrupt, one dict per note:
+            {"pitch": str, "duration": float}.
+        semitone_shifts (tuple, optional): Non-zero semitone shifts the
+            middle note may be transposed by. Defaults to (-2, -1, 1, 2).
+
+    Returns:
+        list[dict]: A fresh melody log (a new list of new note dicts)
+        with exactly one middle note transposed, or an empty list for
+        empty/invalid input.
+    """
+    if not _is_valid_melody_log(melody_log):
+        return []
+
+    mistake_log = [{**step} for step in melody_log]
+
+    # Only notes with a real pitch can be mistuned (rest markers and
+    # unparseable pitches are left alone).
+    singable_indices = [
+        index for index, step in enumerate(mistake_log)
+        if _get_frequency(step.get("pitch")) > 0.0
+    ]
+    if not singable_indices:
+        return mistake_log
+
+    middle = len(mistake_log) / 2.0
+    target_index = min(singable_indices,
+                       key=lambda index: abs((index + 0.5) - middle))
+
+    shift = int(np.random.choice(list(semitone_shifts)))
+    midi_number = _note_name_to_midi(mistake_log[target_index]["pitch"])
+    if midi_number > 0:
+        mistake_log[target_index]["pitch"] = midi_to_note_name(
+            max(1, midi_number + shift))
+    return mistake_log
+
+
+def should_lesson_mistake(mistake_probability=None):
+    """
+    Decides whether the Audiopet makes a mistake while rehearsing a
+    melody during Learn Melody.
+
+    A plain ``np.random.random()`` probability draw decides, keeping
+    the behaviour deterministic under a pinned seed (same structure as
+    the other probability gates).
+
+    Args:
+        mistake_probability (float, optional): Probability of the
+            mistake. Defaults to ``LESSON_MISTAKE_PROBABILITY``.
+
+    Returns:
+        bool: True if the rehearsal should contain the mid-melody
+        mistake (confused noise and a correct second rehearsal follow).
+    """
+    if mistake_probability is None:
+        mistake_probability = LESSON_MISTAKE_PROBABILITY
+    return bool(np.random.random() < mistake_probability)
+
+
+def pick_lesson_redo_noise(angry_probability=None):
+    """
+    Picks which preset noise the Audiopet makes before a Redo Previous
+    Section recording starts.
+
+    With probability ``angry_probability`` the preset angry noise is
+    picked, otherwise the preset confused noise (plain
+    ``np.random.random()`` draw, same seeded-deterministic structure as
+    the other behaviour logic).
+
+    Args:
+        angry_probability (float, optional): Probability of the angry
+            noise. Defaults to ``LESSON_REDO_ANGRY_PROBABILITY``.
+
+    Returns:
+        str: "angry" or "confused".
+    """
+    if angry_probability is None:
+        angry_probability = LESSON_REDO_ANGRY_PROBABILITY
+    return "angry" if np.random.random() < angry_probability else "confused"
+
+
+def generate_lesson_noise(noise_kind, character="default_cat",
+                          output_filename="system_lesson_noise.wav"):
+    """
+    Synthesises one preset lesson-mode event noise and writes it to a
+    dedicated lesson noise file.
+
+    Lesson mode needs a small family of one-off preset noises outside
+    the taught-melody pipeline: the confused or angry noise made before
+    a Redo Previous Section recording, the sad noise made when the user
+    forgets the melody, the confused noise after a rehearsal mistake,
+    and the final happy noise at the end of the Learn Melody rehearsal.
+    Each is rendered in the character's voice from its preset melody
+    (``ANGRY_NOISE_MELODY``, ``CONFUSED_MELODY``, ``SAD_NOISE_MELODY``
+    or ``HAPPY_NOISE_MELODY``) with the matching emotion. The result
+    must never be written to ``system_reply.wav`` (standard pipeline),
+    ``system_noise.wav`` (pokes) or ``system_idle.wav`` (idle noises):
+    callers pass a separate path (e.g.
+    ``data/responses/system_lesson_noise.wav``).
+
+    Fail-safe behaviour: an unknown ``noise_kind`` falls back to the
+    confused noise instead of raising.
+
+    Args:
+        noise_kind (str): One of "angry", "confused", "sad", "happy".
+        character (str, optional): Key into ``VOICE_PROFILES``; falls
+            back to "default_cat" if unknown. Defaults to "default_cat".
+        output_filename (str, optional): Path of the .wav file to
+            write. Defaults to "system_lesson_noise.wav".
+
+    Returns:
+        str: The emotion actually used for the synthesis (matching the
+        requested noise kind, or "confused" for the fallback).
+    """
+    noise_presets = {
+        "angry": (ANGRY_NOISE_MELODY, "angry"),
+        "confused": (CONFUSED_MELODY, "confused"),
+        "sad": (SAD_NOISE_MELODY, "sad"),
+        "happy": (HAPPY_NOISE_MELODY, "happy"),
+    }
+    if noise_kind not in noise_presets:
+        noise_kind = "confused"
+
+    melody_log, emotion = noise_presets[noise_kind]
+    synthesise_output(melody_log,
+                      output_filename=output_filename,
+                      sample_rate=44100,
+                      character=character,
+                      emotion=emotion)
+    return emotion
 
 
 # =====================================================================

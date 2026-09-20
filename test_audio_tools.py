@@ -6,7 +6,10 @@ synthesise_output generating a confused melody when given an empty log),
 and the click-noise API for the clickable character feature (preset
 happy/none click noise melodies, click-count driven emotion draw, and
 generation into a separate system_noise.wav that never touches
-system_reply.wav).
+system_reply.wav), and the lesson mode API (section-by-section melody
+teaching: combining/replacing recorded sections, singing the full
+melody from a dedicated lesson reply file, and a separate long-term
+memory cache capped at LESSON_MEMORY_SIZE for later recall).
 
 Run with:  python3 test_audio_tools.py -v
 """
@@ -37,6 +40,9 @@ from audio_tools import (
     _get_raw_audio_duration,
     determine_emotion,
     CONFUSED_MELODY,
+    HAPPY_NOISE_MELODY,
+    ANGRY_NOISE_MELODY,
+    SAD_NOISE_MELODY,
     VOICE_PROFILES,
     EMOTION_PROFILES,
 )
@@ -1796,6 +1802,828 @@ class TestPresetMelodiesUnderSadEmotion(AudioToolsTestCase):
                 SAMPLE_RATE * sum(float(n["duration"]) for n in preset))
             self.assertEqual(len(data), expected_frames)
             self.assertGreater(np.max(np.abs(data)), 100)
+
+
+# ---------------------------------------------------------------------
+# Lesson mode feature
+# ---------------------------------------------------------------------
+# Baseline for the EXISTING functions the lesson pipeline will reuse.
+# Lesson mode teaches melodies section by section: chunk notes are
+# merged with extend_melody_log(), full melodies are stored with
+# add_to_memory() into a separate long-term cache (capacity 20), and
+# recalled with pick_memory_melody()/should_sing_from_memory(). These
+# tests pin that the existing functions already support all of that
+# without modification (they must stay green before and after).
+LESSON_SECTION_A = [
+    {"pitch": "C5", "duration": 0.3},
+    {"pitch": "D5", "duration": 0.3},
+]
+LESSON_SECTION_B = [{"pitch": "E5", "duration": 0.45}]
+LESSON_SECTION_C = [
+    {"pitch": "F5", "duration": 0.2},
+    {"pitch": "G5", "duration": 0.25},
+    {"pitch": "A5", "duration": 0.3},
+]
+
+
+class TestLessonPipelineBaselines(AudioToolsTestCase):
+    """Baseline: existing functions must already support the lesson flow."""
+
+    def test_extend_melody_log_chains_sections(self):
+        # Repeated section teaching is just successive chunk merges.
+        running = extend_melody_log([], LESSON_SECTION_A)
+        running = extend_melody_log(running, LESSON_SECTION_B)
+        running = extend_melody_log(running, LESSON_SECTION_C)
+        self.assertEqual(len(running), 6)
+        self.assertEqual(
+            [note["pitch"] for note in running],
+            ["C5", "D5", "E5", "F5", "G5", "A5"])
+
+    def test_extend_melody_log_chain_copy_semantics(self):
+        section = [{"pitch": "C5", "duration": 0.3}]
+        running = extend_melody_log([], section)
+        running = extend_melody_log(running, [{"pitch": "E5",
+                                               "duration": 0.3}])
+        section[0]["duration"] = 9.9
+        self.assertEqual(running[0]["duration"], 0.3)
+
+    def test_add_to_memory_supports_capacity_twenty(self):
+        # The long-term lesson cache is just add_to_memory() with
+        # capacity=20 on an independent list (no modification needed).
+        memory = []
+        logs = []
+        for i in range(25):
+            log = [{"pitch": "C5", "duration": round(0.1 + i * 0.01, 2)}]
+            logs.append(log)
+            add_to_memory(log, capacity=20, memory=memory)
+        self.assertEqual(len(memory), 20)
+        self.assertEqual(memory[0], logs[5])
+        self.assertEqual(memory[-1], logs[24])
+
+    def test_pick_memory_melody_works_on_independent_list(self):
+        lesson_memory = [LESSON_SECTION_A, LESSON_SECTION_B]
+        for _ in range(10):
+            self.assertIn(pick_memory_melody(lesson_memory), lesson_memory)
+
+    def test_should_sing_from_memory_custom_probability(self):
+        lesson_memory = [LESSON_SECTION_A]
+        self.assertTrue(
+            should_sing_from_memory(lesson_memory, sing_probability=1.0))
+        self.assertFalse(
+            should_sing_from_memory(lesson_memory, sing_probability=0.0))
+
+    def test_synthesise_output_renders_long_combined_melody(self):
+        # A full taught melody (all sections concatenated) must render
+        # correctly for every character voice.
+        combined = (LESSON_SECTION_A + LESSON_SECTION_B + LESSON_SECTION_C)
+        self.assertGreaterEqual(len(combined), 5)
+        expected_frames = int(SAMPLE_RATE * sum(
+            float(note["duration"]) for note in combined))
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"long_melody_{char}.wav")
+            result = synthesise_output(combined, out_path,
+                                       character=char, emotion="none")
+            self.assertEqual(result, "none")
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            self.assertEqual(sr, SAMPLE_RATE)
+            self.assertEqual(len(data), expected_frames)
+            self.assertGreater(np.max(np.abs(data)), 100)
+
+
+# The lesson-mode API does not exist before the feature is implemented;
+# the imports are guarded so the baseline suite stays runnable in the
+# red phase and the new tests report as "expected failure: not
+# implemented yet" instead of crashing collection.
+try:
+    from audio_tools import (
+        LESSON_MEMORY_SIZE,
+        LESSON_MEMORY_SING_PROBABILITY,
+        long_term_memory,
+        combine_melody_sections,
+        replace_last_section,
+        generate_lesson_reply,
+        add_to_lesson_memory,
+        pick_lesson_memory_melody,
+    )
+    LESSON_API_AVAILABLE = True
+except ImportError:
+    LESSON_API_AVAILABLE = False
+
+try:
+    from audio_tools import (
+        make_mistake_melody,
+        should_lesson_mistake,
+        pick_lesson_redo_noise,
+        generate_lesson_noise,
+        LESSON_MISTAKE_PROBABILITY,
+        LESSON_REDO_ANGRY_PROBABILITY,
+    )
+    LESSON_NOISE_API_AVAILABLE = True
+except ImportError:
+    LESSON_NOISE_API_AVAILABLE = False
+
+try:
+    import app as audiopet_app
+    FLASK_APP_AVAILABLE = True
+except ImportError:
+    FLASK_APP_AVAILABLE = False
+
+
+LESSON_API_PENDING = "lesson-mode API not implemented yet"
+
+LESSON_NOISE_API_PENDING = "lesson noise API not implemented yet"
+
+FLASK_APP_PENDING = "Flask app (app.py) not importable"
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestLessonConstants(unittest.TestCase):
+    """The tunable lesson-mode constants and the long-term cache."""
+
+    def test_lesson_memory_size_default_is_twenty(self):
+        self.assertEqual(LESSON_MEMORY_SIZE, 20)
+
+    def test_lesson_memory_size_is_positive_int(self):
+        self.assertIsInstance(LESSON_MEMORY_SIZE, int)
+        self.assertGreater(LESSON_MEMORY_SIZE, 0)
+
+    def test_lesson_sing_probability_is_controllable_fraction(self):
+        self.assertIsInstance(LESSON_MEMORY_SING_PROBABILITY, float)
+        self.assertGreater(LESSON_MEMORY_SING_PROBABILITY, 0.0)
+        self.assertLess(LESSON_MEMORY_SING_PROBABILITY, 1.0)
+
+    def test_long_term_memory_is_a_list(self):
+        self.assertIsInstance(long_term_memory, list)
+
+    def test_long_term_memory_is_separate_from_short_term(self):
+        import audio_tools as _audio_tools
+        self.assertIsNot(_audio_tools.long_term_memory,
+                         _audio_tools.short_term_memory)
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestCombineMelodySections(unittest.TestCase):
+    """Concatenating taught sections into the full melody."""
+
+    def test_concatenates_sections_in_order(self):
+        result = combine_melody_sections(
+            [LESSON_SECTION_A, LESSON_SECTION_B, LESSON_SECTION_C])
+        self.assertEqual(
+            result,
+            LESSON_SECTION_A + LESSON_SECTION_B + LESSON_SECTION_C)
+
+    def test_empty_sections_list_returns_empty(self):
+        self.assertEqual(combine_melody_sections([]), [])
+        self.assertEqual(combine_melody_sections(None), [])
+
+    def test_invalid_sections_are_skipped(self):
+        result = combine_melody_sections(
+            [LESSON_SECTION_A, [], None, "garbage", LESSON_SECTION_B])
+        self.assertEqual(result, LESSON_SECTION_A + LESSON_SECTION_B)
+
+    def test_all_invalid_sections_returns_empty(self):
+        self.assertEqual(combine_melody_sections([[], None]), [])
+
+    def test_returns_fresh_copies(self):
+        # Mutating the result must not corrupt the caller's sections.
+        section = [{"pitch": "C5", "duration": 0.3}]
+        result = combine_melody_sections([section])
+        result[0]["duration"] = 9.9
+        self.assertEqual(section[0]["duration"], 0.3)
+
+    def test_result_list_not_aliased_to_input(self):
+        section = [{"pitch": "C5", "duration": 0.3}]
+        result = combine_melody_sections([section])
+        result.append({"pitch": "E5", "duration": 0.3})
+        self.assertEqual(len(section), 1)
+
+    def test_repeated_teach_then_combine_matches_extend_chain(self):
+        # Teaching two sections one after the other and then combining
+        # must equal the running-log merge the chunk pipeline performs.
+        sections = [LESSON_SECTION_A, LESSON_SECTION_B, LESSON_SECTION_C]
+        combined = combine_melody_sections(sections)
+        running = []
+        for section in sections:
+            running = extend_melody_log(running, section)
+        self.assertEqual(combined, running)
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestReplaceLastSection(unittest.TestCase):
+    """Redo flow: the latest recorded section is replaced, not appended."""
+
+    def test_replaces_last_section_keeps_earlier_ones(self):
+        sections = [LESSON_SECTION_A, LESSON_SECTION_B, LESSON_SECTION_C]
+        new_section = [{"pitch": "E6", "duration": 0.5}]
+        result = replace_last_section(sections, new_section)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[-1], new_section)
+        self.assertEqual(result[:-1], sections[:-1])
+
+    def test_empty_sections_becomes_single_section(self):
+        # Redo with nothing taught yet: the new recording simply
+        # becomes the first section instead of crashing.
+        new_section = [{"pitch": "E6", "duration": 0.5}]
+        self.assertEqual(replace_last_section([], new_section),
+                         [new_section])
+        self.assertEqual(replace_last_section(None, new_section),
+                         [new_section])
+
+    def test_invalid_new_notes_keeps_previous_section(self):
+        # Fail-safe: an empty/failed redo recording must not wipe the
+        # taught melody; the previous last section stays in place.
+        sections = [LESSON_SECTION_A, LESSON_SECTION_B]
+        for bad in ([], None, "garbage", [{"pitch": "E6"}]):
+            result = replace_last_section(sections, bad)
+            self.assertEqual(result, sections)
+
+    def test_does_not_mutate_input_sections(self):
+        sections = [LESSON_SECTION_A, LESSON_SECTION_B]
+        replace_last_section(sections, [{"pitch": "E6", "duration": 0.5}])
+        self.assertEqual(sections, [LESSON_SECTION_A, LESSON_SECTION_B])
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestGenerateLessonReply(AudioToolsTestCase):
+    """Synthesises the full taught melody from a dedicated lesson file."""
+
+    @staticmethod
+    def _melody_frames(melody):
+        return int(SAMPLE_RATE * sum(float(n["duration"]) for n in melody))
+
+    def test_renders_full_melody_wav(self):
+        full_melody = LESSON_SECTION_A + LESSON_SECTION_B
+        out_path = os.path.join(self.tmpdir, "lesson_reply.wav")
+        emotion = generate_lesson_reply(full_melody, out_path)
+        self.assertIn(emotion, ("happy", "none"))
+        self.assertIsInstance(emotion, str)
+        self.assertTrue(os.path.exists(out_path))
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(sr, SAMPLE_RATE)
+        self.assertEqual(len(data), self._melody_frames(full_melody))
+        self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_empty_melody_falls_back_to_confused_noise(self):
+        # Confused-noise fallback: an empty taught melody renders the
+        # preset confused noise (same fallback as synthesise_output).
+        out_path = os.path.join(self.tmpdir, "lesson_confused.wav")
+        emotion = generate_lesson_reply([], out_path)
+        self.assertEqual(emotion, "confused")
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(CONFUSED_MELODY))
+
+    def test_none_melody_falls_back_to_confused_noise(self):
+        out_path = os.path.join(self.tmpdir, "lesson_confused_none.wav")
+        emotion = generate_lesson_reply(None, out_path)
+        self.assertEqual(emotion, "confused")
+        self.assertTrue(os.path.exists(out_path))
+
+    def test_never_touches_reserved_response_files(self):
+        # system_reply.wav (standard pipeline), system_noise.wav (pokes)
+        # and system_idle.wav (idle noises) are reserved: lesson replies
+        # must never write or overwrite them.
+        reserved = {}
+        for name in ("system_reply.wav", "system_noise.wav",
+                     "system_idle.wav"):
+            path = os.path.join(self.tmpdir, name)
+            write_wav(path, make_tone(440.0, 0.5))
+            with open(path, "rb") as f:
+                reserved[name] = f.read()
+        lesson_path = os.path.join(self.tmpdir, "system_lesson_reply.wav")
+        generate_lesson_reply(LESSON_SECTION_A, lesson_path)
+        for name, before in reserved.items():
+            path = os.path.join(self.tmpdir, name)
+            self.assertTrue(os.path.exists(path))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+    def test_does_not_create_reserved_files_if_absent(self):
+        for name in ("system_reply.wav", "system_noise.wav",
+                     "system_idle.wav"):
+            path = os.path.join(self.tmpdir, name)
+            if os.path.exists(path):
+                os.remove(path)
+        lesson_path = os.path.join(self.tmpdir, "lesson_only.wav")
+        generate_lesson_reply(LESSON_SECTION_A, lesson_path)
+        for name in ("system_reply.wav", "system_noise.wav",
+                     "system_idle.wav"):
+            self.assertFalse(os.path.exists(os.path.join(self.tmpdir, name)))
+
+    def test_unknown_character_falls_back_to_default(self):
+        out_path = os.path.join(self.tmpdir, "lesson_unknown.wav")
+        emotion = generate_lesson_reply(LESSON_SECTION_B, out_path,
+                                        character="not_a_character")
+        self.assertIn(emotion, ("happy", "none"))
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self._melody_frames(LESSON_SECTION_B))
+
+    def test_every_voice_renders_lesson_reply(self):
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"lesson_{char}.wav")
+            emotion = generate_lesson_reply(LESSON_SECTION_A, out_path,
+                                            character=char)
+            self.assertIn(emotion, ("happy", "none"))
+            self.assertTrue(os.path.exists(out_path))
+
+    def test_emotion_draw_matches_np_random_choice_structure(self):
+        # Regression guard: the happy/none delivery draw must reuse the
+        # plain np.random.choice structure so it stays deterministic
+        # under a pinned seed (the draw fires before any synthesis).
+        out_path = os.path.join(self.tmpdir, "lesson_seeded.wav")
+        np.random.seed(23)
+        expected = str(np.random.choice(["none", "happy"], p=[0.70, 0.30]))
+        np.random.seed(23)
+        emotion = generate_lesson_reply(LESSON_SECTION_A, out_path)
+        self.assertEqual(emotion, expected)
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestAddToLessonMemory(unittest.TestCase):
+    """Storage of finished melodies in the separate long-term cache."""
+
+    def test_capped_to_latest_twenty(self):
+        memory = []
+        logs = []
+        for i in range(25):
+            log = [{"pitch": "C5", "duration": round(0.1 + i * 0.01, 2)}]
+            logs.append(log)
+            add_to_lesson_memory(log, memory=memory)
+        self.assertEqual(len(memory), 20)
+        # 25 logs with capacity 20: the five oldest are evicted, the
+        # newest entries retained in order.
+        self.assertEqual(memory[0], logs[5])
+        self.assertEqual(memory[-1], logs[24])
+
+    def test_default_capacity_is_lesson_memory_size(self):
+        # The default capacity must come from LESSON_MEMORY_SIZE (20),
+        # not the short-term MEMORY_SIZE (5).
+        memory = []
+        for i in range(LESSON_MEMORY_SIZE + 1):
+            add_to_lesson_memory(
+                [{"pitch": "C5", "duration": round(0.1 + i * 0.01, 2)}],
+                memory=memory)
+        self.assertEqual(len(memory), LESSON_MEMORY_SIZE)
+
+    def test_empty_and_malformed_logs_ignored(self):
+        # Confused-noise fallback cases (empty logs) must never be
+        # stored, mirroring the short-term memory behaviour.
+        memory = []
+        for bad in ([], None, "garbage", [{"pitch": "C5"}], 42):
+            add_to_lesson_memory(bad, memory=memory)
+        self.assertEqual(memory, [])
+
+    def test_stores_copy_not_reference(self):
+        # Later mutation of the caller's log must not corrupt the cache.
+        memory = []
+        log = [{"pitch": "C5", "duration": 0.3}]
+        add_to_lesson_memory(log, memory=memory)
+        log.append({"pitch": "E5", "duration": 0.3})
+        self.assertEqual(len(memory[0]), 1)
+
+    def test_defaults_to_module_level_long_term_memory(self):
+        # Omitting memory must store into long_term_memory and never
+        # touch short_term_memory, keeping the two caches separate.
+        lesson_snapshot = list(long_term_memory)
+        from audio_tools import short_term_memory as _short_term
+        short_snapshot = list(_short_term)
+        try:
+            add_to_lesson_memory(LESSON_SECTION_A)
+            self.assertEqual(len(long_term_memory),
+                             len(lesson_snapshot) + 1)
+            self.assertIn(LESSON_SECTION_A, long_term_memory)
+            self.assertEqual(_short_term, short_snapshot)
+        finally:
+            long_term_memory[:] = lesson_snapshot
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestPickLessonMemoryMelody(unittest.TestCase):
+    """Random selection of a learned melody from the long-term cache."""
+
+    def test_empty_memory_returns_none(self):
+        self.assertIsNone(pick_lesson_memory_melody([]))
+        self.assertIsNone(pick_lesson_memory_melody(None))
+
+    def test_returns_member_of_lesson_memory(self):
+        memory = [LESSON_SECTION_A, LESSON_SECTION_B, LESSON_SECTION_C]
+        for _ in range(10):
+            self.assertIn(pick_lesson_memory_melody(memory), memory)
+
+    def test_seeded_draw_matches_np_random_choice(self):
+        # Regression guard: selection must reuse the plain np.random
+        # draw structure so it stays deterministic under a pinned seed.
+        memory = [LESSON_SECTION_A, LESSON_SECTION_B, LESSON_SECTION_C]
+        np.random.seed(29)
+        result = pick_lesson_memory_melody(memory)
+        np.random.seed(29)
+        expected = memory[int(np.random.randint(len(memory)))]
+        self.assertEqual(result, expected)
+
+
+@unittest.skipUnless(LESSON_API_AVAILABLE, LESSON_API_PENDING)
+class TestLessonMemoryRecallGate(unittest.TestCase):
+    """Controllable-probability recall gate for the long-term cache."""
+
+    def test_default_probability_uses_lesson_constant(self):
+        memory = [LESSON_SECTION_A]
+        np.random.seed(31)
+        expected = np.random.random() < LESSON_MEMORY_SING_PROBABILITY
+        np.random.seed(31)
+        result = should_sing_from_memory(
+            memory, sing_probability=LESSON_MEMORY_SING_PROBABILITY)
+        self.assertEqual(result, expected)
+
+    def test_empty_lesson_memory_never_sings(self):
+        # Even at probability 1.0 there is nothing to recall from.
+        np.random.seed(0)
+        self.assertFalse(
+            should_sing_from_memory([], sing_probability=1.0))
+
+
+@unittest.skipUnless(LESSON_NOISE_API_AVAILABLE, LESSON_NOISE_API_PENDING)
+class TestLessonNoiseConstants(unittest.TestCase):
+    """The tunable lesson event-noise constants."""
+
+    def test_mistake_probability_is_controllable_fraction(self):
+        self.assertIsInstance(LESSON_MISTAKE_PROBABILITY, float)
+        self.assertGreater(LESSON_MISTAKE_PROBABILITY, 0.0)
+        self.assertLess(LESSON_MISTAKE_PROBABILITY, 1.0)
+
+    def test_redo_angry_probability_is_controllable_fraction(self):
+        self.assertIsInstance(LESSON_REDO_ANGRY_PROBABILITY, float)
+        self.assertGreater(LESSON_REDO_ANGRY_PROBABILITY, 0.0)
+        self.assertLess(LESSON_REDO_ANGRY_PROBABILITY, 1.0)
+
+
+@unittest.skipUnless(LESSON_NOISE_API_AVAILABLE, LESSON_NOISE_API_PENDING)
+class TestMakeMistakeMelody(AudioToolsTestCase):
+    """Corrupting one middle note for the Learn Melody mistake."""
+
+    MELODY = [
+        {"pitch": "C5", "duration": 0.3},
+        {"pitch": "E5", "duration": 0.3},
+        {"pitch": "G5", "duration": 0.3},
+        {"pitch": "A5", "duration": 0.3},
+        {"pitch": "C6", "duration": 0.3},
+    ]
+
+    def test_exactly_one_note_changes_pitch(self):
+        np.random.seed(7)
+        result = make_mistake_melody(self.MELODY)
+        self.assertEqual(len(result), len(self.MELODY))
+        changed = [i for i, (a, b) in enumerate(zip(self.MELODY, result))
+                   if a["pitch"] != b["pitch"]]
+        self.assertEqual(len(changed), 1)
+
+    def test_durations_and_other_notes_untouched(self):
+        np.random.seed(7)
+        result = make_mistake_melody(self.MELODY)
+        for i, (a, b) in enumerate(zip(self.MELODY, result)):
+            self.assertEqual(a["duration"], b["duration"], f"note {i}")
+            if a["pitch"] == b["pitch"]:
+                self.assertEqual(a, b)
+
+    def test_mistake_lands_in_the_middle(self):
+        # The corrupted note must be the one closest to the melody's
+        # midpoint, not the first or last note.
+        np.random.seed(11)
+        result = make_mistake_melody(self.MELODY)
+        changed_index = next(
+            i for i, (a, b) in enumerate(zip(self.MELODY, result))
+            if a["pitch"] != b["pitch"])
+        self.assertIn(changed_index, (2,))
+
+    def test_shifted_pitch_is_a_valid_note(self):
+        np.random.seed(3)
+        result = make_mistake_melody(self.MELODY)
+        for note in result:
+            self.assertNotEqual(_get_frequency(note["pitch"]), 0.0)
+
+    def test_mistuned_note_differs_from_original(self):
+        # The corruption must be audible: a non-zero semitone shift.
+        np.random.seed(3)
+        result = make_mistake_melody(self.MELODY)
+        for a, b in zip(self.MELODY, result):
+            if a["pitch"] != b["pitch"]:
+                self.assertNotEqual(
+                    _get_frequency(a["pitch"]),
+                    _get_frequency(b["pitch"]))
+
+    def test_returns_fresh_copies(self):
+        np.random.seed(5)
+        result = make_mistake_melody(self.MELODY)
+        result[0]["duration"] = 9.9
+        self.assertEqual(self.MELODY[0]["duration"], 0.3)
+        result[0]["pitch"] = "Z9"
+        self.assertEqual(self.MELODY[0]["pitch"], "C5")
+
+    def test_does_not_mutate_input(self):
+        snapshot = [dict(note) for note in self.MELODY]
+        make_mistake_melody(self.MELODY)
+        self.assertEqual(self.MELODY, snapshot)
+
+    def test_invalid_melody_returns_empty(self):
+        for bad in ([], None, "garbage", [{"pitch": "C5"}], 42):
+            self.assertEqual(make_mistake_melody(bad), [])
+
+    def test_melody_without_singable_notes_unchanged_copy(self):
+        melody = [{"pitch": "rest", "duration": 0.3}]
+        result = make_mistake_melody(melody)
+        self.assertEqual(result, melody)
+        self.assertIsNot(result[0], melody[0])
+
+    def test_every_voice_can_render_the_mistake(self):
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"mistake_{char}.wav")
+            np.random.seed(13)
+            mistake = make_mistake_melody(self.MELODY)
+            emotion = generate_lesson_reply(mistake, out_path,
+                                            character=char)
+            self.assertIn(emotion, ("happy", "none"))
+            self.assertTrue(os.path.exists(out_path))
+
+
+@unittest.skipUnless(LESSON_NOISE_API_AVAILABLE, LESSON_NOISE_API_PENDING)
+class TestShouldLessonMistake(unittest.TestCase):
+    """Controllable-probability mistake gate for the Learn rehearsal."""
+
+    def test_probability_bounds(self):
+        self.assertFalse(should_lesson_mistake(mistake_probability=0.0))
+        self.assertTrue(should_lesson_mistake(mistake_probability=1.0))
+
+    def test_default_probability_uses_lesson_constant(self):
+        np.random.seed(41)
+        expected = np.random.random() < LESSON_MISTAKE_PROBABILITY
+        np.random.seed(41)
+        self.assertEqual(should_lesson_mistake(), expected)
+
+
+@unittest.skipUnless(LESSON_NOISE_API_AVAILABLE, LESSON_NOISE_API_PENDING)
+class TestPickLessonRedoNoise(unittest.TestCase):
+    """Angry/confused draw for the pre-redo noise."""
+
+    def test_probability_bounds(self):
+        self.assertEqual(pick_lesson_redo_noise(angry_probability=0.0),
+                         "confused")
+        self.assertEqual(pick_lesson_redo_noise(angry_probability=1.0),
+                         "angry")
+
+    def test_default_probability_uses_lesson_constant(self):
+        np.random.seed(43)
+        expected = ("angry"
+                    if np.random.random() < LESSON_REDO_ANGRY_PROBABILITY
+                    else "confused")
+        np.random.seed(43)
+        self.assertEqual(pick_lesson_redo_noise(), expected)
+
+    def test_result_is_always_a_known_noise_kind(self):
+        np.random.seed(0)
+        for _ in range(10):
+            self.assertIn(pick_lesson_redo_noise(), ("angry", "confused"))
+
+
+@unittest.skipUnless(LESSON_NOISE_API_AVAILABLE, LESSON_NOISE_API_PENDING)
+class TestGenerateLessonNoise(AudioToolsTestCase):
+    """Preset lesson event noises rendered into a dedicated file."""
+
+    NOISE_FRAME_COUNTS = {
+        "angry": int(SAMPLE_RATE * sum(n["duration"]
+                                       for n in ANGRY_NOISE_MELODY)),
+        "confused": int(SAMPLE_RATE * sum(n["duration"]
+                                          for n in CONFUSED_MELODY)),
+        "sad": int(SAMPLE_RATE * sum(n["duration"]
+                                     for n in SAD_NOISE_MELODY)),
+        "happy": int(SAMPLE_RATE * sum(n["duration"]
+                                       for n in HAPPY_NOISE_MELODY)),
+    }
+
+    def test_each_kind_renders_its_preset_with_matching_emotion(self):
+        for kind, expected_emotion in (("angry", "angry"),
+                                       ("confused", "confused"),
+                                       ("sad", "sad"),
+                                       ("happy", "happy")):
+            out_path = os.path.join(self.tmpdir, f"noise_{kind}.wav")
+            emotion = generate_lesson_noise(kind, output_filename=out_path)
+            self.assertEqual(emotion, expected_emotion)
+            self.assertTrue(os.path.exists(out_path))
+            sr, data = wavfile.read(out_path)
+            self.assertEqual(sr, SAMPLE_RATE)
+            self.assertEqual(len(data), self.NOISE_FRAME_COUNTS[kind])
+            self.assertGreater(np.max(np.abs(data)), 100)
+
+    def test_unknown_kind_falls_back_to_confused(self):
+        out_path = os.path.join(self.tmpdir, "noise_unknown.wav")
+        emotion = generate_lesson_noise("not_a_noise",
+                                        output_filename=out_path)
+        self.assertEqual(emotion, "confused")
+        sr, data = wavfile.read(out_path)
+        self.assertEqual(len(data), self.NOISE_FRAME_COUNTS["confused"])
+
+    def test_renders_in_every_character_voice(self):
+        for char in VOICE_PROFILES:
+            out_path = os.path.join(self.tmpdir, f"noise_{char}.wav")
+            emotion = generate_lesson_noise("sad", character=char,
+                                            output_filename=out_path)
+            self.assertEqual(emotion, "sad")
+            self.assertTrue(os.path.exists(out_path))
+
+    def test_never_touches_reserved_response_files(self):
+        # system_reply.wav (standard pipeline), system_noise.wav (pokes)
+        # and system_idle.wav (idle noises) are reserved.
+        reserved = {}
+        for name in ("system_reply.wav", "system_noise.wav",
+                     "system_idle.wav"):
+            path = os.path.join(self.tmpdir, name)
+            write_wav(path, make_tone(440.0, 0.5))
+            with open(path, "rb") as f:
+                reserved[name] = f.read()
+        noise_path = os.path.join(self.tmpdir, "system_lesson_noise.wav")
+        generate_lesson_noise("angry", output_filename=noise_path)
+        for name, before in reserved.items():
+            path = os.path.join(self.tmpdir, name)
+            self.assertTrue(os.path.exists(path))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+
+@unittest.skipUnless(FLASK_APP_AVAILABLE, FLASK_APP_PENDING)
+class TestLessonRoutes(unittest.TestCase):
+    """Flask route behaviour of the lesson event-noise endpoints."""
+
+    TEACH_SECTION = [{"pitch": "C5", "duration": 0.3},
+                     {"pitch": "E5", "duration": 0.3}]
+
+    def setUp(self):
+        audiopet_app.app.config["TESTING"] = True
+        self.client = audiopet_app.app.test_client()
+        audiopet_app.reset_lesson_session(active=False)
+
+    def tearDown(self):
+        audiopet_app.reset_lesson_session(active=False)
+
+    def start_lesson(self):
+        response = self.client.post("/api/lesson-start")
+        self.assertEqual(response.status_code, 200)
+
+    def test_fresh_lesson_greys_redo_noise_endpoint(self):
+        # Before the first successful Teach New Notes the redo noise
+        # must be unavailable (the redo button is greyed client-side).
+        self.start_lesson()
+        response = self.client.post("/api/lesson-redo-noise")
+        self.assertEqual(response.status_code, 409)
+
+    def test_empty_teach_stop_failsafe_confused_no_section(self):
+        # Failsafe: stopping a recording with an empty melody log
+        # plays the confused noise and records no section, so the
+        # redo/finish buttons stay greyed (section_count stays 0).
+        self.start_lesson()
+        response = self.client.post("/api/lesson-stop")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["emotion"], "confused")
+        self.assertEqual(data["section_count"], 0)
+        self.assertFalse(data["section_recorded"])
+        self.assertEqual(audiopet_app.lesson_session["sections"], [])
+
+    def test_empty_teach_after_section_failsafe_confused(self):
+        # Even with sections already taught, an empty recording must
+        # play the confused noise and append nothing.
+        self.start_lesson()
+        audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+        response = self.client.post("/api/lesson-stop")
+        data = response.get_json()
+        self.assertEqual(data["emotion"], "confused")
+        self.assertEqual(data["section_count"], 1)
+        self.assertFalse(data["section_recorded"])
+        self.assertEqual(audiopet_app.lesson_session["sections"],
+                         [self.TEACH_SECTION])
+
+    def test_valid_teach_records_section_and_sings_it(self):
+        self.start_lesson()
+        audiopet_app.lesson_session["current_notes"] = self.TEACH_SECTION
+        response = self.client.post("/api/lesson-stop")
+        data = response.get_json()
+        self.assertIn(data["emotion"], ("happy", "none"))
+        self.assertEqual(data["section_count"], 1)
+        self.assertTrue(data["section_recorded"])
+        self.assertEqual(audiopet_app.lesson_session["sections"],
+                         [self.TEACH_SECTION])
+
+    def test_empty_redo_keeps_previous_section_confused_noise(self):
+        self.start_lesson()
+        audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+        audiopet_app.lesson_session["mode"] = "redo"
+        response = self.client.post("/api/lesson-stop")
+        data = response.get_json()
+        self.assertEqual(data["emotion"], "confused")
+        self.assertEqual(data["section_count"], 1)
+        self.assertEqual(audiopet_app.lesson_session["sections"],
+                         [self.TEACH_SECTION])
+
+    def test_redo_noise_available_after_successful_teach(self):
+        self.start_lesson()
+        audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+        response = self.client.post("/api/lesson-redo-noise")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn(data["emotion"], ("angry", "confused"))
+        self.assertTrue(data["audio_url"].endswith(".wav"))
+
+    def test_forget_returns_sad_noise_before_reset(self):
+        self.start_lesson()
+        response = self.client.post("/api/lesson-forget")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["emotion"], "sad")
+        self.assertTrue(data["forgotten"])
+        self.assertFalse(data["finished"])
+
+    def test_learn_sequence_ends_with_happy_noise(self):
+        # The Learn rehearsal sequence always ends with the final
+        # happy noise; the reset to a fresh lesson follows afterwards.
+        self.start_lesson()
+        original_memory = list(audiopet_app.long_term_memory)
+        try:
+            audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+            response = self.client.post("/api/lesson-learn")
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertTrue(data["learned"])
+            sequence = data["sequence"]
+            self.assertGreaterEqual(len(sequence), 2)
+            self.assertEqual(sequence[-1]["emotion"], "happy")
+            self.assertEqual(data["audio_url"], sequence[0]["audio_url"])
+        finally:
+            audiopet_app.long_term_memory[:] = original_memory
+
+    def test_learn_mistake_sequence_structure(self):
+        # With the mistake draw forced, the sequence must be: mistuned
+        # rendition, confused noise, correct rendition, happy noise.
+        self.start_lesson()
+        original_memory = list(audiopet_app.long_term_memory)
+        original_mistake = audiopet_app.should_lesson_mistake
+        try:
+            audiopet_app.should_lesson_mistake = lambda *a, **k: True
+            audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+            response = self.client.post("/api/lesson-learn")
+            data = response.get_json()
+            sequence = data["sequence"]
+            self.assertEqual(len(sequence), 4)
+            self.assertNotEqual(sequence[0]["emotion"], "confused")
+            self.assertEqual(sequence[1]["emotion"], "confused")
+            self.assertIn(sequence[2]["emotion"], ("happy", "none"))
+            self.assertEqual(sequence[3]["emotion"], "happy")
+        finally:
+            audiopet_app.should_lesson_mistake = original_mistake
+            audiopet_app.long_term_memory[:] = original_memory
+
+    def test_learn_without_mistake_rehearses_correctly_then_happy(self):
+        self.start_lesson()
+        original_memory = list(audiopet_app.long_term_memory)
+        original_mistake = audiopet_app.should_lesson_mistake
+        try:
+            audiopet_app.should_lesson_mistake = lambda *a, **k: False
+            audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+            response = self.client.post("/api/lesson-learn")
+            data = response.get_json()
+            sequence = data["sequence"]
+            self.assertEqual(len(sequence), 2)
+            self.assertIn(sequence[0]["emotion"], ("happy", "none"))
+            self.assertEqual(sequence[1]["emotion"], "happy")
+        finally:
+            audiopet_app.should_lesson_mistake = original_mistake
+            audiopet_app.long_term_memory[:] = original_memory
+
+    def test_learn_empty_melody_confused_only(self):
+        self.start_lesson()
+        response = self.client.post("/api/lesson-learn")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data["learned"])
+        self.assertEqual(len(data["sequence"]), 1)
+        self.assertEqual(data["sequence"][0]["emotion"], "confused")
+
+    def test_redo_noise_and_forget_sad_share_dedicated_file(self):
+        # Both render into the dedicated lesson noise file and never
+        # touch the reserved poke noise file.
+        self.start_lesson()
+        audiopet_app.lesson_session["sections"] = [self.TEACH_SECTION]
+        noise_path = os.path.join(audiopet_app.RESPONSE_FOLDER,
+                                  "system_lesson_noise.wav")
+        if os.path.exists(noise_path):
+            os.remove(noise_path)
+        self.client.post("/api/lesson-redo-noise")
+        self.assertTrue(os.path.exists(noise_path))
+        poke_path = os.path.join(audiopet_app.RESPONSE_FOLDER,
+                                 "system_noise.wav")
+        before = None
+        if os.path.exists(poke_path):
+            with open(poke_path, "rb") as f:
+                before = f.read()
+        self.client.post("/api/lesson-forget")
+        with open(poke_path, "rb") as f:
+            self.assertEqual(f.read(), before)
 
 
 if __name__ == "__main__":

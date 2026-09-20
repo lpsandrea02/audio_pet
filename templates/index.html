@@ -213,10 +213,20 @@
             <button id="play-btn" disabled>▶ Play Last Reply</button>
             <button id="talk-btn" style="display:none">🎤︎ Start Talking</button>
         </div>
+        <div class="controls" id="lesson-controls" style="display:none">
+            <button id="lesson-teach-btn">♪ Teach New Notes</button>
+            <button id="lesson-redo-btn" disabled>↺ Redo Previous Section</button>
+            <button id="lesson-finish-btn" disabled>✓ Finished Melody</button>
+            <button id="lesson-stop-btn" class="recording" style="display:none">⏺ Stop Recording</button>
+            <button id="lesson-learn-btn" style="display:none">♪ Learn Melody</button>
+            <button id="lesson-forget-btn" style="display:none">✗ Forget Melody</button>
+        </div>
         <div id="status" class="status-text">Status: Idle</div>
         <div class="back-btn-row">
             <button id="settings-btn" class="back-btn">⚙ Settings</button>
             <button id="interactive-btn" class="back-btn">✿ Interactive Mode</button>
+            <button id="lesson-btn" class="back-btn">♫ Lesson Mode</button>
+            <button id="lesson-exit-btn" class="back-btn" style="display:none">⎋ Exit Lesson Mode</button>
         </div>
     </div>
 
@@ -287,7 +297,7 @@ const CHARACTER_REGISTRY = {
         "none":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n(♡´𓋰`♡)\n(ა       ૮)" },
         "happy":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n❀(♡´𓋰`♡)❀\n(ა       ૮)" },
         "sad":    { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n     (♡´ᯅ`ς)՞°·.\n(っ       )" },
-        "angry":  { closed: "⑅ᐢ---ᐢ \n( ´︿` )\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n( ´𓋰`ꐦ)\n(ა       ૮)" },
+        "angry":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n(♡´𓋰`ꐦ)\n(ა       ૮)" },
         "confused":  { closed: "⑅ᐢ---ᐢ \n(♡´︿`♡)\n(ა       ૮)", open: "⑅ᐢ---ᐢ \n?(♡´𓋰`♡)?\n(ა       ૮)" }
     },
     "chirp_bird": {
@@ -531,6 +541,10 @@ playBtn.addEventListener("click", () => {
 // user-gesture click, but is never cached into lastResponseAudioUrl,
 // so the "Play Last Reply" button cannot replay it.
 asciiDisplay.addEventListener("click", async () => {
+    // While a lesson section is being recorded (or an event noise is
+    // queued before one) the pet stays quiet: singing into the running
+    // recording would pollute the section.
+    if (lessonMode && (lessonRecording || lessonNoisePending)) return;
     clickCount += 1;
     resetIdleCycle();
     statusText.textContent = "Status: Poked!";
@@ -747,11 +761,14 @@ if (fontSelect.value !== "default") {
 const interactiveBtn = document.getElementById("interactive-btn");
 const talkBtn = document.getElementById("talk-btn");
 
-interactiveBtn.addEventListener("click", () => {
-    if (!interactiveMode) {
-        enterInteractiveMode();
-    } else {
+interactiveBtn.addEventListener("click", async () => {
+    if (interactiveMode) {
         exitInteractiveMode();
+    } else {
+        if (lessonMode) {
+            await exitLessonMode();
+        }
+        enterInteractiveMode();
     }
 });
 
@@ -1044,12 +1061,502 @@ function stopInteractiveReply() {
     interactivePetSpeaking = false;
 }
 
-// Swapping characters also leaves interactive mode cleanly
+// Swapping characters also leaves interactive mode and lesson mode
+// cleanly
 swapCharacterBtn.addEventListener("click", () => {
-    if (interactiveMode) {
+    if (lessonMode) {
+        exitLessonMode();
+    } else if (interactiveMode) {
         exitInteractiveMode();
     }
 });
+
+// =====================================================================
+// 9. LESSON MODE (teach melodies section by section)
+// =====================================================================
+// Activating lesson mode hides the record/play controls and shows the
+// lesson controls: Teach New Notes records one section, Redo Previous
+// Section re-records the latest one (replacing, never appending), and
+// Finished Melody sings the full taught melody once before the user
+// chooses Learn Melody (stored into the backend's long-term lesson
+// memory) or Forget Melody (fresh lesson, nothing stored). While
+// recording, the top row is replaced by a single red Stop Recording
+// button: there is NO silence-based turn end here, a section only
+// ends when the user stops it explicitly. Audio is streamed to the
+// backend as ~0.5s standalone WAV chunks (same pipeline as
+// interactive mode) and accumulated server-side; every finished
+// section makes the pet sing the full melody taught so far.
+const lessonBtn = document.getElementById("lesson-btn");
+const lessonExitBtn = document.getElementById("lesson-exit-btn");
+const lessonControls = document.getElementById("lesson-controls");
+const lessonTeachBtn = document.getElementById("lesson-teach-btn");
+const lessonRedoBtn = document.getElementById("lesson-redo-btn");
+const lessonFinishBtn = document.getElementById("lesson-finish-btn");
+const lessonStopBtn = document.getElementById("lesson-stop-btn");
+const lessonLearnBtn = document.getElementById("lesson-learn-btn");
+const lessonForgetBtn = document.getElementById("lesson-forget-btn");
+
+let lessonMode = false;             // ♫ button toggles this
+let lessonRecording = false;        // ⏺ currently recording a section
+let lessonRecordingMode = "teach";  // "teach" or "redo"
+let lessonFinished = false;         // finished melody sung, awaiting learn/forget
+let lessonNoisePending = false;     // an event noise playback is in progress
+let lessonStream = null;
+let lessonAudioCtx = null;
+let lessonSource = null;
+let lessonProcessor = null;
+let lessonSilenceGain = null;
+let lessonChunkBuffer = [];         // Float32 blocks for the next chunk
+let lessonChunkSamples = 0;         // samples per ~0.5s chunk
+let lessonSendChain = Promise.resolve(); // serialize chunk/stop posts
+let lessonPrevIdleEnabled = true;   // idle noises paused in mode
+
+lessonBtn.addEventListener("click", async () => {
+    if (lessonMode) {
+        exitLessonMode();
+    } else {
+        if (interactiveMode) {
+            await exitInteractiveMode();
+        }
+        enterLessonMode();
+    }
+});
+
+lessonExitBtn.addEventListener("click", () => {
+    exitLessonMode();
+});
+
+lessonTeachBtn.addEventListener("click", () => startLessonRecording("teach"));
+lessonRedoBtn.addEventListener("click", () => startLessonRecording("redo"));
+lessonStopBtn.addEventListener("click", () => stopLessonRecording());
+lessonFinishBtn.addEventListener("click", () => finishLessonMelody());
+lessonLearnBtn.addEventListener("click", () => learnLessonMelody());
+lessonForgetBtn.addEventListener("click", () => forgetLessonMelody());
+
+// Plays an ordered list of lesson playback pieces ({"audio_url",
+// "emotion"}) back to back, switching the character emotion per piece,
+// and calls onAllEnded after the final piece finishes (or immediately
+// when the list is empty). Playback comes straight from user clicks so
+// autoplay is allowed; if the browser blocks it the sequence skips
+// ahead so the flow never strands.
+const LESSON_NOISE_BUFFER_MS = 600; // decay time after the last piece
+
+function playLessonSequence(sequence, onAllEnded) {
+    if (!Array.isArray(sequence) || sequence.length === 0) {
+        if (onAllEnded) onAllEnded();
+        return;
+    }
+    stopNoisePlayback();
+    let pieceIndex = 0;
+    const playNextPiece = () => {
+        if (pieceIndex >= sequence.length) {
+            isSpeaking = false;
+            statusText.textContent = "Status: Idle";
+            // Slight buffer after the last piece (e.g. the upset sad
+            // noise) so its speaker tail decays before the UI returns
+            // or the next section starts recording.
+            setTimeout(() => {
+                if (!lessonMode) {
+                    lessonNoisePending = false;
+                    return;
+                }
+                if (onAllEnded) onAllEnded();
+            }, LESSON_NOISE_BUFFER_MS);
+            return;
+        }
+        const piece = sequence[pieceIndex++];
+        const audio = new Audio(piece.audio_url + "?t=" + new Date().getTime());
+        audio.volume = masterVolume;
+        noiseAudio = audio;
+        currentEmotion = piece.emotion || currentEmotion;
+        isSpeaking = true;
+        statusText.textContent = "Status: Character singing (Lesson)...";
+        renderFrame();
+        audio.onended = playNextPiece;
+        audio.play().catch(err => {
+            console.warn("Lesson playback blocked by browser policy.", err);
+            playNextPiece();
+        });
+    };
+    playNextPiece();
+}
+
+async function enterLessonMode() {
+    lessonMode = true;
+    lessonPrevIdleEnabled = idleEnabled;
+    idleEnabled = false; // idle noises are paused during the session
+    stopIdleTimer();
+    recordBtn.style.display = "none";
+    playBtn.style.display = "none";
+    talkBtn.style.display = "none";
+    lessonControls.style.display = "";
+    interactiveBtn.style.display = "none";
+    lessonExitBtn.style.display = "";
+    resetLessonUi();
+    try {
+        await fetch("/api/lesson-start", { method: "POST" });
+    } catch (err) {
+        console.error("Lesson start breakdown:", err);
+    }
+}
+
+async function exitLessonMode() {
+    stopLessonStreaming();
+    lessonRecording = false;
+    lessonNoisePending = false;
+    stopNoisePlayback();
+    lessonMode = false;
+    lessonFinished = false;
+    recordBtn.style.display = "";
+    playBtn.style.display = "";
+    lessonControls.style.display = "none";
+    interactiveBtn.style.display = "";
+    lessonExitBtn.style.display = "none";
+    statusText.textContent = "Status: Idle";
+    idleEnabled = lessonPrevIdleEnabled;
+    try {
+        await fetch("/api/lesson-exit", { method: "POST" });
+    } catch (err) {
+        console.error("Lesson exit breakdown:", err);
+    }
+    resetIdleCycle();
+}
+
+// Fresh lesson state: teach enabled, redo/finish greyed, learn/forget
+// hidden. Also called after Learn/Forget to start the next lesson.
+function resetLessonUi() {
+    lessonFinished = false;
+    lessonRecording = false;
+    lessonTeachBtn.style.display = "";
+    lessonTeachBtn.disabled = false;
+    lessonRedoBtn.style.display = "";
+    lessonRedoBtn.disabled = true;
+    lessonFinishBtn.style.display = "";
+    lessonFinishBtn.disabled = true;
+    lessonStopBtn.style.display = "none";
+    lessonLearnBtn.style.display = "none";
+    lessonForgetBtn.style.display = "none";
+    statusText.textContent = "Status: Lesson ready! Teach some notes.";
+}
+
+// Keeps redo/finish availability in sync with the sections the backend
+// actually taught (the server is the source of truth).
+function updateLessonButtons(sectionCount) {
+    if (lessonFinished) return;
+    const hasSections = sectionCount > 0;
+    lessonRedoBtn.disabled = !hasSections;
+    lessonFinishBtn.disabled = !hasSections;
+}
+
+function stopNoisePlayback() {
+    if (noiseAudio) {
+        noiseAudio.pause();
+        noiseAudio = null;
+    }
+    isSpeaking = false;
+}
+
+function stopLessonStreaming() {
+    if (lessonProcessor) {
+        lessonProcessor.onaudioprocess = null;
+        try { lessonProcessor.disconnect(); } catch (err) {}
+        lessonProcessor = null;
+    }
+    if (lessonSource) {
+        try { lessonSource.disconnect(); } catch (err) {}
+        lessonSource = null;
+    }
+    if (lessonSilenceGain) {
+        try { lessonSilenceGain.disconnect(); } catch (err) {}
+        lessonSilenceGain = null;
+    }
+    if (lessonAudioCtx) {
+        try { lessonAudioCtx.close(); } catch (err) {}
+        lessonAudioCtx = null;
+    }
+    if (lessonStream) {
+        lessonStream.getTracks().forEach(track => track.stop());
+        lessonStream = null;
+    }
+    lessonChunkBuffer = [];
+    lessonChunkSamples = 0;
+}
+
+// Teach starts recording immediately; Redo first fetches and plays the
+// pet's confused/angry noise (probability drawn server-side) and only
+// starts the recording after the noise finishes, so the pet's own
+// noise is never recorded into the new section.
+async function startLessonRecording(mode) {
+    if (!lessonMode || lessonRecording || lessonFinished || lessonNoisePending) return;
+
+    if (mode !== "redo") {
+        startLessonRecordingNow(mode);
+        return;
+    }
+    if (lessonRedoBtn.disabled) return; // nothing taught yet
+
+    lessonNoisePending = true;
+    lessonRedoBtn.disabled = true;
+    let noiseData = null;
+    try {
+        const formData = new FormData();
+        formData.append("current_skin", currentSkin);
+        const response = await fetch("/api/lesson-redo-noise", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        noiseData = await response.json();
+    } catch (err) {
+        console.error("Lesson redo noise breakdown:", err);
+    }
+
+    if (noiseData && noiseData.audio_url) {
+        playLessonSequence(
+            [{ audio_url: noiseData.audio_url, emotion: noiseData.emotion }],
+            () => {
+                lessonNoisePending = false;
+                startLessonRecordingNow(mode);
+            });
+    } else {
+        lessonNoisePending = false;
+        startLessonRecordingNow(mode);
+    }
+}
+
+async function startLessonRecordingNow(mode) {
+    if (!lessonMode || lessonRecording || lessonFinished) return;
+
+    // Cut off any still-playing reply so it is never recorded into the
+    // new section.
+    stopNoisePlayback();
+    clickCount = 0; // a direct interaction calms the pet down
+    // Recording a new section always starts from a clean mood: e.g.
+    // after Forget Melody the upset sad face lingers, but the pet is
+    // cheerful again the moment the user teaches the next section.
+    currentEmotion = "happy";
+    renderFrame();
+    lessonRecordingMode = mode;
+
+    lessonAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+        await lessonAudioCtx.resume();
+    } catch (err) {
+        console.warn("AudioContext resume blocked in gesture.", err);
+    }
+
+    try {
+        lessonStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+        console.error("Microphone access breakdown:", err);
+        try { lessonAudioCtx.close(); } catch (closeErr) {}
+        lessonAudioCtx = null;
+        statusText.textContent = "Status: Microphone access denied.";
+        return;
+    }
+
+    lessonSource = lessonAudioCtx.createMediaStreamSource(lessonStream);
+    lessonProcessor = lessonAudioCtx.createScriptProcessor(4096, 1, 1);
+    lessonChunkSamples = Math.floor(
+        lessonAudioCtx.sampleRate * INTERACTIVE_CHUNK_SECONDS);
+
+    lessonProcessor.onaudioprocess = (event) => {
+        if (!lessonRecording) return;
+        lessonChunkBuffer.push(
+            new Float32Array(event.inputBuffer.getChannelData(0)));
+        const buffered = lessonChunkBuffer.reduce(
+            (sum, block) => sum + block.length, 0);
+        if (buffered >= lessonChunkSamples) {
+            const merged = new Float32Array(buffered);
+            let offset = 0;
+            for (const block of lessonChunkBuffer) {
+                merged.set(block, offset);
+                offset += block.length;
+            }
+            lessonChunkBuffer = [];
+            const blob = buildInteractiveWavBlob(
+                merged, lessonAudioCtx.sampleRate);
+            queueLessonChunk(blob);
+        }
+    };
+
+    lessonSilenceGain = lessonAudioCtx.createGain();
+    lessonSilenceGain.gain.value = 0;
+    lessonSource.connect(lessonProcessor);
+    lessonProcessor.connect(lessonSilenceGain);
+    lessonSilenceGain.connect(lessonAudioCtx.destination);
+
+    lessonRecording = true;
+    // Swap the top row for the single red Stop Recording button.
+    lessonTeachBtn.style.display = "none";
+    lessonRedoBtn.style.display = "none";
+    lessonFinishBtn.style.display = "none";
+    lessonStopBtn.style.display = "";
+    statusText.textContent = (mode === "redo")
+        ? "Status: Re-recording previous section..."
+        : "Status: Recording new section...";
+}
+
+// Chunk posts (and the final stop) are serialized so the backend never
+// processes overlapping requests for the same section.
+function queueLessonChunk(blob) {
+    lessonSendChain = lessonSendChain
+        .then(() => sendLessonChunk(blob))
+        .catch(() => {});
+}
+
+async function sendLessonChunk(blob) {
+    const formData = new FormData();
+    formData.append("file", blob, "lesson_chunk.wav");
+    formData.append("current_skin", currentSkin);
+    formData.append("recording", "true");
+    formData.append("mode", lessonRecordingMode);
+    try {
+        const response = await fetch("/api/lesson-chunk", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+        updateLessonButtons(data.section_count || 0);
+    } catch (err) {
+        console.error("Lesson chunk transmission breakdown:", err);
+    }
+}
+
+async function stopLessonRecording() {
+    if (!lessonMode || !lessonRecording) return;
+    lessonRecording = false;
+    stopLessonStreaming();
+
+    const formData = new FormData();
+    formData.append("current_skin", currentSkin);
+
+    // Serialize behind any pending chunk posts so every chunk of the
+    // section reaches the backend before the stop finalises it.
+    lessonSendChain = lessonSendChain
+        .then(async () => {
+            const response = await fetch("/api/lesson-stop", {
+                method: "POST",
+                body: formData
+            });
+            if (!response.ok) throw new Error("Server communication glitch");
+            const data = await response.json();
+            lessonTeachBtn.style.display = "";
+            lessonRedoBtn.style.display = "";
+            lessonFinishBtn.style.display = "";
+            lessonStopBtn.style.display = "none";
+            updateLessonButtons(data.section_count || 0);
+            statusText.textContent = "Status: Character singing (Lesson)...";
+            playClickNoise(data.audio_url + "?t=" + new Date().getTime(),
+                           data.emotion);
+        })
+        .catch(err => {
+            console.error("Lesson stop transmission breakdown:", err);
+            resetLessonUi();
+        });
+}
+
+async function finishLessonMelody() {
+    if (!lessonMode || lessonRecording || lessonFinished || lessonNoisePending) return;
+
+    try {
+        const formData = new FormData();
+        formData.append("current_skin", currentSkin);
+        const response = await fetch("/api/lesson-finish", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+
+        // The finished melody sings once; the top row is replaced by
+        // the Learn Melody / Forget Melody decision.
+        lessonFinished = true;
+        lessonTeachBtn.style.display = "none";
+        lessonRedoBtn.style.display = "none";
+        lessonFinishBtn.style.display = "none";
+        lessonLearnBtn.style.display = "";
+        lessonLearnBtn.disabled = false;
+        lessonForgetBtn.style.display = "";
+        lessonForgetBtn.disabled = false;
+        statusText.textContent = "Status: Character singing (Lesson)...";
+        playClickNoise(data.audio_url + "?t=" + new Date().getTime(),
+                       data.emotion);
+    } catch (err) {
+        console.error("Lesson finish transmission breakdown:", err);
+    }
+}
+
+async function learnLessonMelody() {
+    if (!lessonMode || lessonRecording || !lessonFinished || lessonNoisePending) return;
+    lessonNoisePending = true;
+    lessonLearnBtn.disabled = true;
+    lessonForgetBtn.disabled = true;
+
+    const finishLearnUi = (learned) => {
+        lessonNoisePending = false;
+        resetLessonUi();
+        statusText.textContent = learned
+            ? "Status: Melody learned! Teaching a fresh one..."
+            : "Status: Nothing to learn yet.";
+    };
+
+    try {
+        const formData = new FormData();
+        formData.append("current_skin", currentSkin);
+        const response = await fetch("/api/lesson-learn", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+
+        // The full rehearsal (mistake rendition + confused noise +
+        // correct rendition, when one happens) plus the final happy
+        // noise arrive as an ordered playback sequence.
+        const sequence = (Array.isArray(data.sequence) && data.sequence.length)
+            ? data.sequence
+            : [{ audio_url: data.audio_url, emotion: data.emotion }];
+        playLessonSequence(sequence, () => finishLearnUi(data.learned));
+    } catch (err) {
+        console.error("Lesson learn transmission breakdown:", err);
+        lessonNoisePending = false;
+        resetLessonUi();
+    }
+}
+
+async function forgetLessonMelody() {
+    if (!lessonMode || lessonRecording || !lessonFinished || lessonNoisePending) return;
+    lessonNoisePending = true;
+    lessonLearnBtn.disabled = true;
+    lessonForgetBtn.disabled = true;
+
+    const finishForgetUi = () => {
+        lessonNoisePending = false;
+        resetLessonUi();
+    };
+
+    try {
+        const formData = new FormData();
+        formData.append("current_skin", currentSkin);
+        const response = await fetch("/api/lesson-forget", {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) throw new Error("Server communication glitch");
+        const data = await response.json();
+        // The sad noise plays first; only afterwards does the lesson
+        // return to the fresh state.
+        playLessonSequence(
+            [{ audio_url: data.audio_url, emotion: data.emotion }],
+            finishForgetUi);
+    } catch (err) {
+        console.error("Lesson forget transmission breakdown:", err);
+        lessonNoisePending = false;
+        resetLessonUi();
+    }
+}
 
 </script>
 </body>
